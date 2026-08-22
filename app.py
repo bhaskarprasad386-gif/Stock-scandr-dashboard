@@ -25,10 +25,9 @@ st.info(
 
 # ============================================================
 # ANGEL ONE SECRETS
-# ============================================================
-
+# ===========================================
 API_KEY = st.secrets.get("ANGEL_API_KEY", "")
-CLIENT_ID = st.secrets.get("ANGEL_CLIENT_ID", "")
+CLIENT_ID = st.secrets.get("ANGEL_CLIENT_CODE", "")
 PASSWORD = st.secrets.get("ANGEL_PASSWORD", "")
 TOTP_SECRET = st.secrets.get("ANGEL_TOTP_SECRET", "")
 
@@ -37,7 +36,7 @@ if not API_KEY:
     st.stop()
 
 if not CLIENT_ID:
-    st.error("ANGEL_CLIENT_ID नहीं मिला")
+    st.error("ANGEL_CLIENT_CODE नहीं मिला")
     st.stop()
 
 if not PASSWORD:
@@ -47,7 +46,6 @@ if not PASSWORD:
 if not TOTP_SECRET:
     st.error("ANGEL_TOTP_SECRET नहीं मिला")
     st.stop()
-
 # ============================================================
 # ANGEL ONE
 # ============================================================
