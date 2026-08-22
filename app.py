@@ -764,4 +764,4 @@ st.caption(
 st.caption(
     "Only positive Future − Spot stocks are displayed."
 )
-```
+
