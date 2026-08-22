@@ -613,4 +613,3 @@ st.divider()
 st.caption(
     "Final Formula: (Current Month Future − Spot) × Lot Size"
 )
-```
