@@ -6,16 +6,17 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 st.set_page_config(
-    page_title="F&O Scanner",
+    page_title="F&O Spot Future Scanner",
     page_icon="📊",
     layout="wide"
 )
 
 st.title("📊 F&O Spot − Current Month Future Scanner")
+st.caption("Angel One Live F&O Scanner")
 
-# ============================================================
+# =========================================================
 # SECRETS
-# ============================================================
+# =========================================================
 
 API_KEY = st.secrets.get("ANGEL_API_KEY", "")
 CLIENT_CODE = st.secrets.get("ANGEL_CLIENT_CODE", "")
@@ -31,9 +32,9 @@ if not all([
     st.error("Angel One Secrets अधूरे हैं।")
     st.stop()
 
-# ============================================================
-# ANGEL ONE HEADERS
-# ============================================================
+# =========================================================
+# ANGEL ONE
+# =========================================================
 
 BASE_URL = "https://apiconnect.angelone.in"
 
@@ -48,15 +49,14 @@ HEADERS = {
     "X-MACAddress": "00:00:00:00:00:00"
 }
 
-# ============================================================
+
+# =========================================================
 # LOGIN
-# ============================================================
+# =========================================================
 
 def angel_login():
 
-    totp = pyotp.TOTP(
-        TOTP_SECRET
-    ).now()
+    totp = pyotp.TOTP(TOTP_SECRET).now()
 
     response = requests.post(
         BASE_URL +
@@ -75,15 +75,15 @@ def angel_login():
     if not data.get("status"):
         raise Exception(
             "Angel One Login Failed: " +
-            str(data.get("message"))
+            str(data.get("message", "Unknown error"))
         )
 
     return data["data"]["jwtToken"]
 
 
-# ============================================================
+# =========================================================
 # MASTER DATA
-# ============================================================
+# =========================================================
 
 @st.cache_data(ttl=3600)
 def load_master():
@@ -100,143 +100,87 @@ def load_master():
 
     response.raise_for_status()
 
-    data = response.json()
-
-    if not data:
-        raise Exception(
-            "Angel One master data खाली है।"
-        )
-
-    return pd.DataFrame(data)
+    return pd.DataFrame(response.json())
 
 
-# ============================================================
-# EXPIRY
-# ============================================================
+# =========================================================
+# EXPIRY PARSER
+# =========================================================
 
-def parse_expiry(value):
+def parse_expiry(x):
 
-    if pd.isna(value):
+    if pd.isna(x):
         return pd.NaT
 
-    value = str(value).strip().upper()
+    x = str(x).strip().upper()
 
-    for fmt in [
+    formats = [
         "%d%b%Y",
         "%d-%b-%Y",
         "%d/%b/%Y",
         "%d-%m-%Y",
         "%d/%m/%Y",
-        "%Y-%m-%d"
-    ]:
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S"
+    ]
+
+    for fmt in formats:
 
         try:
             return pd.to_datetime(
-                value,
+                x,
                 format=fmt
             )
         except:
             pass
 
     return pd.to_datetime(
-        value,
+        x,
         errors="coerce",
         dayfirst=True
     )
 
 
-# ============================================================
-# FIND FUTURES AUTOMATICALLY
-# ============================================================
+# =========================================================
+# FIND CURRENT MONTH FUTURES
+# =========================================================
 
-def find_futures(df):
+def get_current_month_futures(master):
 
-    today = pd.Timestamp(
-        datetime.now(
-            ZoneInfo("Asia/Kolkata")
-        ).date()
-    )
+    df = master.copy()
 
-    # --------------------------------------------------------
-    # Debug information
-    # --------------------------------------------------------
-
-    st.write("### 🔍 Angel One Master Information")
-
-    segments = (
-        df["exch_seg"]
-        .astype(str)
-        .str.lower()
-        .value_counts()
-        .head(20)
-    )
-
-    instruments = (
-        df["instrumenttype"]
-        .astype(str)
-        .str.upper()
-        .value_counts()
-        .head(30)
-    )
-
-    st.write("**Exchange Segments:**")
-    st.write(segments)
-
-    st.write("**Instrument Types:**")
-    st.write(instruments)
-
-    # --------------------------------------------------------
-    # Find F&O using multiple possible segment names
-    # --------------------------------------------------------
-
-    segment = (
-        df["exch_seg"]
-        .astype(str)
-        .str.lower()
-    )
-
-    possible_segments = [
-        "nse_fo",
-        "nfo",
-        "nsefo"
-    ]
-
+    # IMPORTANT:
+    # Angel One master में NSE F&O = nfo
     futures = df[
-        segment.isin(
-            possible_segments
-        )
+        df["exch_seg"]
+        .astype(str)
+        .str.lower()
+        .eq("nfo")
     ].copy()
 
-    # --------------------------------------------------------
-    # If segment matching fails,
-    # search using symbol/instrument information
-    # --------------------------------------------------------
-
     if futures.empty:
-
-        instrument = (
-            df["instrumenttype"]
-            .astype(str)
-            .str.upper()
-        )
-
-        futures = df[
-            instrument.str.contains(
-                "FUT",
-                na=False
-            )
-        ].copy()
-
-    if futures.empty:
-
         raise Exception(
-            "Angel One master में Future contracts नहीं मिले।"
+            "NFO segment नहीं मिला।"
         )
 
-    # --------------------------------------------------------
-    # Parse expiry
-    # --------------------------------------------------------
+    # Stock Futures only
+    instrument = (
+        futures["instrumenttype"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
 
+    futures = futures[
+        instrument.eq("FUTSTK")
+    ].copy()
+
+    if futures.empty:
+        raise Exception(
+            "NFO में FUTSTK contracts नहीं मिले।"
+        )
+
+    # Expiry
     futures["expiry_date"] = (
         futures["expiry"]
         .apply(parse_expiry)
@@ -246,108 +190,82 @@ def find_futures(df):
         futures["expiry_date"].notna()
     ].copy()
 
+    today = pd.Timestamp(
+        datetime.now(
+            ZoneInfo("Asia/Kolkata")
+        ).date()
+    )
+
     futures = futures[
         futures["expiry_date"] >= today
     ].copy()
 
     if futures.empty:
-
         raise Exception(
-            "Future contracts मिले लेकिन valid future expiry नहीं मिली।"
+            "Current date के बाद कोई FUTSTK expiry नहीं मिली।"
         )
 
-    # --------------------------------------------------------
-    # Stock futures
-    # --------------------------------------------------------
-
-    instrument = (
-        futures["instrumenttype"]
-        .astype(str)
-        .str.upper()
+    # Nearest expiry = current active month
+    current_expiry = (
+        futures["expiry_date"].min()
     )
 
-    stock_futures = futures[
-        instrument.str.contains(
-            "FUTSTK",
-            na=False
-        )
+    current = futures[
+        futures["expiry_date"]
+        == current_expiry
     ].copy()
 
-    # अगर FUTSTK नाम अलग है तो
-    # symbol में FUT खोजें
-
-    if stock_futures.empty:
-
-        stock_futures = futures[
-            futures["symbol"]
-            .astype(str)
-            .str.upper()
-            .str.contains(
-                "FUT",
-                na=False
-            )
-        ].copy()
-
-    if stock_futures.empty:
-
-        raise Exception(
-            "Stock Futures (FUTSTK) नहीं मिले।"
-        )
-
-    # --------------------------------------------------------
-    # Current nearest expiry
-    # --------------------------------------------------------
-
-    current_expiry = (
-        stock_futures[
-            "expiry_date"
-        ].min()
+    current["token"] = (
+        current["token"]
+        .astype(str)
     )
 
-    current = stock_futures[
-        stock_futures[
-            "expiry_date"
-        ] == current_expiry
+    current["name_clean"] = (
+        current["name"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    current["lotsize_num"] = pd.to_numeric(
+        current["lotsize"],
+        errors="coerce"
+    )
+
+    current = current[
+        current["lotsize_num"].notna()
     ].copy()
 
     return current, current_expiry
 
 
-# ============================================================
-# SPOT STOCKS
-# ============================================================
+# =========================================================
+# FIND NSE SPOT
+# =========================================================
 
-def find_spot(df):
+def get_spot(master):
 
-    segment = (
+    df = master.copy()
+
+    spot = df[
         df["exch_seg"]
         .astype(str)
         .str.lower()
-    )
-
-    spot = df[
-        segment.isin([
-            "nse_cm",
-            "nse"
-        ])
+        .eq("nse")
     ].copy()
 
-    if spot.empty:
-
-        # fallback
-        spot = df[
-            df["symbol"]
-            .astype(str)
-            .str.upper()
-            .str.endswith("-EQ")
-        ].copy()
-
+    # Only equity
     spot["symbol_clean"] = (
         spot["symbol"]
         .astype(str)
         .str.upper()
         .str.strip()
     )
+
+    spot = spot[
+        spot["symbol_clean"]
+        .str.endswith("-EQ")
+    ].copy()
 
     spot["name_clean"] = (
         spot["name"]
@@ -364,9 +282,9 @@ def find_spot(df):
     return spot
 
 
-# ============================================================
-# QUOTE
-# ============================================================
+# =========================================================
+# GET LTP
+# =========================================================
 
 def get_ltp(
     jwt,
@@ -415,23 +333,31 @@ def get_ltp(
     )
 
 
-# ============================================================
+# =========================================================
 # SCANNER
-# ============================================================
+# =========================================================
 
-def scan():
+def run_scanner():
 
     master = load_master()
 
-    futures, expiry = find_futures(
-        master
+    # -----------------------------
+    # Current month futures
+    # -----------------------------
+
+    futures, expiry = (
+        get_current_month_futures(
+            master
+        )
     )
 
-    spot = find_spot(
+    # -----------------------------
+    # NSE spot
+    # -----------------------------
+
+    spot = get_spot(
         master
     )
-
-    jwt = angel_login()
 
     # Spot lookup
     spot_lookup = {}
@@ -440,45 +366,59 @@ def scan():
 
         name = row["name_clean"]
 
-        if name == "NAN":
-            continue
+        if name and name != "NAN":
 
-        spot_lookup[name] = row
+            spot_lookup[name] = {
+                "token": row["token"],
+                "symbol": row["symbol_clean"]
+            }
+
+    # -----------------------------
+    # Login
+    # -----------------------------
+
+    jwt = angel_login()
 
     results = []
 
-    # --------------------------------------------------------
-    # Match Future with Spot
-    # --------------------------------------------------------
+    # -----------------------------
+    # Process futures
+    # -----------------------------
 
     for _, future in futures.iterrows():
 
-        name = (
+        stock_name = (
             str(future["name"])
             .upper()
             .strip()
         )
 
-        if name not in spot_lookup:
+        if stock_name not in spot_lookup:
             continue
 
-        spot_row = spot_lookup[name]
+        spot_token = spot_lookup[
+            stock_name
+        ]["token"]
+
+        future_token = str(
+            future["token"]
+        )
 
         try:
 
             spot_ltp = get_ltp(
                 jwt,
                 "NSE",
-                spot_row["token"]
+                spot_token
             )
 
             future_ltp = get_ltp(
                 jwt,
                 "NFO",
-                future["token"]
+                future_token
             )
 
-        except:
+        except Exception:
 
             continue
 
@@ -490,67 +430,97 @@ def scan():
 
         lot_size = int(
             float(
-                future["lotsize"]
+                future["lotsize_num"]
             )
         )
 
-        # ----------------------------------------------------
-        # USER FORMULA
-        # ----------------------------------------------------
+        # ---------------------------------
+        # Spot minus Future
+        # ---------------------------------
 
         difference = (
             spot_ltp -
             future_ltp
         )
 
+        # ---------------------------------
+        # Difference × Lot Size
+        # ---------------------------------
+
         value = (
             difference *
             lot_size
         )
 
+        difference_pct = (
+            difference /
+            future_ltp *
+            100
+            if future_ltp != 0
+            else 0
+        )
+
         results.append({
 
-            "Stock": name,
+            "Stock":
+                stock_name,
 
-            "Spot": round(
-                spot_ltp,
-                2
-            ),
+            "Spot":
+                round(
+                    spot_ltp,
+                    2
+                ),
 
-            "Current Future": round(
-                future_ltp,
-                2
-            ),
+            "Current Future":
+                round(
+                    future_ltp,
+                    2
+                ),
 
-            "Difference": round(
-                difference,
-                2
-            ),
+            "Difference":
+                round(
+                    difference,
+                    2
+                ),
 
-            "Lot Size": lot_size,
+            "Lot Size":
+                lot_size,
 
-            "Difference × Lot": round(
-                value,
-                2
-            ),
+            "Difference × Lot":
+                round(
+                    value,
+                    2
+                ),
+
+            "Difference %":
+                round(
+                    difference_pct,
+                    2
+                ),
 
             "Expiry":
                 expiry.strftime(
                     "%d-%b-%Y"
-                )
+                ),
+
+            "Future Symbol":
+                future["symbol"]
         })
 
     if not results:
 
         raise Exception(
-            "Spot और Future का live LTP नहीं मिला।"
+            "Spot और Current Month Future का live data नहीं मिला।"
         )
 
     result = pd.DataFrame(
         results
     )
 
-    # सबसे बड़ी value ऊपर
+    # ---------------------------------
+    # Highest value first
+    # ---------------------------------
+
     result = result.sort_values(
         "Difference × Lot",
         ascending=False
@@ -567,12 +537,12 @@ def scan():
         )
     )
 
-    return result
+    return result, expiry
 
 
-# ============================================================
-# BUTTON
-# ============================================================
+# =========================================================
+# DASHBOARD
+# =========================================================
 
 st.subheader(
     "⚡ Current Month F&O Scanner"
@@ -584,49 +554,75 @@ if st.button(
     use_container_width=True
 ):
 
-    try:
+    with st.spinner(
+        "Angel One से live Spot और Future data लिया जा रहा है..."
+    ):
 
-        with st.spinner(
-            "Angel One data पढ़ा जा रहा है..."
-        ):
+        try:
 
-            result = scan()
+            result, expiry = (
+                run_scanner()
+            )
 
-        st.success(
-            "✅ Scanner completed"
-        )
+            st.success(
+                "✅ Scanner completed"
+            )
 
-        st.subheader(
-            "🏆 Highest Difference × Lot"
-        )
+            col1, col2, col3 = st.columns(3)
 
-        st.dataframe(
-            result,
-            use_container_width=True,
-            hide_index=True,
-            height=650
-        )
+            col1.metric(
+                "Stocks",
+                len(result)
+            )
 
-        csv = result.to_csv(
-            index=False
-        ).encode("utf-8")
+            col2.metric(
+                "Current Expiry",
+                expiry.strftime(
+                    "%d-%b-%Y"
+                )
+            )
 
-        st.download_button(
-            "⬇️ Download CSV",
-            csv,
-            "fo_scanner.csv",
-            "text/csv",
-            use_container_width=True
-        )
+            col3.metric(
+                "Highest Value",
+                f"₹{result['Difference × Lot'].iloc[0]:,.0f}"
+            )
 
-    except Exception as e:
+            st.subheader(
+                "🏆 Ranking — Difference × Lot Size"
+            )
 
-        st.error(
-            "Scanner Error: " +
-            str(e)
-        )
+            st.dataframe(
+                result,
+                use_container_width=True,
+                hide_index=True,
+                height=650
+            )
 
+            csv = result.to_csv(
+                index=False
+            ).encode("utf-8")
+
+            st.download_button(
+                "⬇️ Download CSV",
+                csv,
+                "fo_scanner.csv",
+                "text/csv",
+                use_container_width=True
+            )
+
+        except Exception as e:
+
+            st.error(
+                "Scanner Error: " +
+                str(e)
+            )
+
+else:
+
+    st.info(
+        "ऊपर 🔄 Scan Now दबाएँ।"
+    )
 
 st.caption(
-    "Ranking = (Spot − Current Month Future) × Lot Size"
+    "Formula: (Spot − Current Month Future) × Lot Size"
 )
