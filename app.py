@@ -1,5 +1,3 @@
-            pass
-
     return pd.to_datetime(
         value,
         errors="coerce",
