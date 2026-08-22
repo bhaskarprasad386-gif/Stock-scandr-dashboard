@@ -692,3 +692,30 @@ st.caption(
     "multiplied by lot size and does not include brokerage, taxes, "
     "slippage, margin or financing costs."
 )
+st.divider()
+st.subheader("🔍 Angel One Expiry Debug")
+
+try:
+    debug_master = load_master()
+
+    debug_futures = prepare_futures(
+        debug_master
+    )
+
+    st.write(
+        "Angel One master में expiry के कुछ values:"
+    )
+
+    st.write(
+        debug_futures["expiry"]
+        .astype(str)
+        .drop_duplicates()
+        .head(20)
+        .tolist()
+    )
+
+except Exception as e:
+
+    st.error(
+        "Debug Error: " + str(e)
+    )
