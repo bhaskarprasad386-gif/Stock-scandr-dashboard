@@ -1,85 +1,198 @@
+```python
+import streamlit as st
+import pandas as pd
+import requests
+import pyotp
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# ============================================================
+# PAGE
+# ============================================================
+
+st.set_page_config(
+    page_title="F&O Future Premium Scanner",
+    page_icon="📊",
+    layout="wide"
+)
+
+st.title("📊 NSE F&O Future − Spot Scanner")
+
+st.info(
+    "सिर्फ वही stock दिखेगा जिसका Current Month Future > Spot है"
+)
+
+# ============================================================
+# ANGEL ONE SECRETS
+# ============================================================
+
+API_KEY = st.secrets.get("ANGEL_API_KEY", "")
+CLIENT_ID = st.secrets.get("ANGEL_CLIENT_ID", "")
+PASSWORD = st.secrets.get("ANGEL_PASSWORD", "")
+TOTP_SECRET = st.secrets.get("ANGEL_TOTP_SECRET", "")
+
+if not API_KEY:
+    st.error("ANGEL_API_KEY नहीं मिला")
+    st.stop()
+
+if not CLIENT_ID:
+    st.error("ANGEL_CLIENT_ID नहीं मिला")
+    st.stop()
+
+if not PASSWORD:
+    st.error("ANGEL_PASSWORD नहीं मिला")
+    st.stop()
+
+if not TOTP_SECRET:
+    st.error("ANGEL_TOTP_SECRET नहीं मिला")
+    st.stop()
+
+# ============================================================
+# ANGEL ONE
+# ============================================================
+
+BASE_URL = "https://apiconnect.angelone.in"
+
+HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "X-UserType": "USER",
+    "X-SourceID": "WEB",
+    "X-PrivateKey": API_KEY,
+    "X-ClientLocalIP": "127.0.0.1",
+    "X-ClientPublicIP": "127.0.0.1",
+    "X-MACAddress": "00:00:00:00:00:00"
+}
+
+# ============================================================
+# LOGIN
+# ============================================================
+
+def login_angel():
+
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+
+    response = requests.post(
+        BASE_URL + "/rest/auth/angelbroking/user/v1/loginByPassword",
+        json={
+            "clientcode": CLIENT_ID,
+            "password": PASSWORD,
+            "totp": totp
+        },
+        headers=HEADERS,
+        timeout=30
+    )
+
+    data = response.json()
+
+    if data.get("status") is not True:
+        raise Exception(
+            "Angel One Login Failed: "
+            + str(data.get("message", "Unknown error"))
+        )
+
+    return data["data"]["jwtToken"]
+
+
+# ============================================================
+# MASTER DOWNLOAD
+# ============================================================
+
+@st.cache_data(ttl=1800)
+def get_master():
+
+    url = (
+        "https://margincalculator.angelbroking.com/"
+        "OpenAPI_File/files/OpenAPIScripMaster.json"
+    )
+
+    response = requests.get(
+        url,
+        timeout=60
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not data:
+        raise Exception("Angel One master खाली है")
+
+    return pd.DataFrame(data)
+
+
+# ============================================================
+# EXPIRY
+# ============================================================
+
+def expiry_date(value):
+
+    if pd.isna(value):
+        return pd.NaT
+
+    text = str(value).strip()
+
+    formats = [
+        "%d%b%Y",
+        "%d-%b-%Y",
+        "%d/%b/%Y",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S"
+    ]
+
+    for fmt in formats:
+        try:
+            return pd.to_datetime(
+                text,
+                format=fmt
+            )
+        except Exception:
+            continue
+
     return pd.to_datetime(
-        value,
+        text,
         errors="coerce",
         dayfirst=True
     )
 
 
-def get_ltp(
-    jwt,
-    exchange,
-    tokens
-):
+# ============================================================
+# PREPARE STOCKS
+# ============================================================
 
-    if not tokens:
-        return {}
+def prepare_stocks(df):
 
-    headers = HEADERS.copy()
+    df = df.copy()
 
-    headers["Authorization"] = (
-        "Bearer " + jwt
+    df["expiry_date"] = df["expiry"].apply(
+        expiry_date
     )
 
-    prices = {}
+    df["lot_size"] = pd.to_numeric(
+        df["lotsize"],
+        errors="coerce"
+    )
 
-    for start in range(
-        0,
-        len(tokens),
-        100
-    ):
+    df["token"] = df["token"].astype(str)
+    df["symbol"] = df["symbol"].astype(str)
+    df["name"] = df["name"].astype(str).str.upper()
 
-        batch = tokens[
-            start:start + 100
-        ]
+    df["exchange"] = (
+        df["exch_seg"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
 
-        response = requests.post(
-            BASE_URL +
-            "/rest/secure/angelbroking/"
-            "market/v1/quote/",
-            json={
-                "mode": "LTP",
-                "exchangeTokens": {
-                    exchange: batch
-                }
-            },
-            headers=headers,
-            timeout=30
-        )
-
-        data = response.json()
-
-        if not data.get("status"):
-            continue
-
-        fetched = (
-            data
-            .get("data", {})
-            .get("fetched", [])
-        )
-
-        for item in fetched:
-
-            token = str(
-                item.get(
-                    "symbolToken",
-                    ""
-                )
-            )
-
-            ltp = item.get("ltp")
-
-            if token and ltp is not None:
-
-                prices[token] = float(
-                    ltp
-                )
-
-    return prices
-
-
-def run_scanner():
-
-    master = load_master()
+    df["instrument"] = (
+        df["instrumenttype"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
 
     today = pd.Timestamp(
         datetime.now(
@@ -87,285 +200,298 @@ def run_scanner():
         ).date()
     )
 
-    # ==============================
-    # NSE F&O = nfo
-    # ==============================
+    # --------------------------------------------------------
+    # ALL NSE STOCK FUTURES
+    # --------------------------------------------------------
 
-    nfo = master[
-        master["exch_seg"]
-        .astype(str)
-        .str.lower()
-        .eq("nfo")
-    ].copy()
-
-    if nfo.empty:
-
-        raise Exception(
-            "Angel One में nfo segment नहीं मिला।"
-        )
-
-    # ==============================
-    # Stock Futures
-    # ==============================
-
-    futures = nfo[
-        nfo["instrumenttype"]
-        .astype(str)
-        .str.upper()
-        .eq("FUTSTK")
+    futures = df[
+        (df["exchange"] == "NFO")
+        &
+        (df["instrument"] == "FUTSTK")
+        &
+        (df["expiry_date"].notna())
+        &
+        (df["expiry_date"] >= today)
+        &
+        (df["lot_size"].notna())
     ].copy()
 
     if futures.empty:
-
         raise Exception(
-            "NFO में FUTSTK contracts नहीं मिले।"
-        )
-
-    futures["expiry_date"] = (
-        futures["expiry"]
-        .apply(parse_expiry)
-    )
-
-    futures["lot_size"] = pd.to_numeric(
-        futures["lotsize"],
-        errors="coerce"
-    )
-
-    futures = futures[
-        futures["expiry_date"].notna()
-    ]
-
-    futures = futures[
-        futures["expiry_date"] >= today
-    ]
-
-    futures = futures[
-        futures["lot_size"].notna()
-    ]
-
-    if futures.empty:
-
-        raise Exception(
-            "Valid future expiry नहीं मिली।"
+            "NFO FUTSTK stock futures नहीं मिले"
         )
 
     # सबसे नजदीकी expiry
-    current_expiry = (
-        futures["expiry_date"].min()
-    )
+    nearest = futures["expiry_date"].min()
 
     futures = futures[
-        futures["expiry_date"]
-        == current_expiry
+        futures["expiry_date"] == nearest
     ].copy()
 
-    # ==============================
-    # NSE Cash = nse
-    # ==============================
+    # --------------------------------------------------------
+    # NSE CASH
+    # --------------------------------------------------------
 
-    cash = master[
-        master["exch_seg"]
-        .astype(str)
-        .str.lower()
-        .eq("nse")
-    ].copy()
-
-    cash["base_symbol"] = (
-        cash["symbol"]
-        .astype(str)
-        .str.upper()
-        .str.replace(
-            "-EQ",
-            "",
-            regex=False
+    cash = df[
+        (df["exchange"] == "NSE")
+        &
+        (
+            df["symbol"]
+            .str.upper()
+            .str.endswith("-EQ")
         )
-    )
-
-    cash = cash[
-        cash["symbol"]
-        .astype(str)
-        .str.upper()
-        .str.endswith("-EQ")
     ].copy()
 
-    cash_lookup = dict(
-        zip(
-            cash["base_symbol"],
-            cash["token"].astype(str)
+    if cash.empty:
+        raise Exception(
+            "NSE cash stocks नहीं मिले"
         )
-    )
 
-    # ==============================
-    # Match futures with spot
-    # ==============================
+    # --------------------------------------------------------
+    # SPOT MAP
+    # --------------------------------------------------------
 
-    contracts = []
+    spot_map = {}
+
+    for _, row in cash.iterrows():
+
+        name = (
+            str(row["symbol"])
+            .upper()
+            .replace("-EQ", "")
+            .strip()
+        )
+
+        spot_map[name] = {
+            "symbol": str(row["symbol"]),
+            "token": str(row["token"])
+        }
+
+    # --------------------------------------------------------
+    # MATCH FUTURES WITH SPOT
+    # --------------------------------------------------------
+
+    stocks = []
 
     for _, row in futures.iterrows():
 
-        name = (
+        future_name = (
             str(row["name"])
             .upper()
             .strip()
         )
 
-        symbol = (
+        future_symbol = (
             str(row["symbol"])
             .upper()
             .strip()
         )
 
-        underlying = name
+        match = None
 
-        if underlying not in cash_lookup:
+        # 1. Master name match
+        if future_name in spot_map:
+            match = future_name
 
-            if symbol.endswith("FUT"):
+        # 2. FUT symbol match
+        if match is None and future_symbol.endswith("FUT"):
 
-                underlying = symbol[
-                    :-3
-                ]
+            base = future_symbol[:-3].strip()
 
-        if underlying not in cash_lookup:
+            if base in spot_map:
+                match = base
+
+        if match is None:
             continue
 
-        contracts.append({
+        spot = spot_map[match]
 
-            "Stock": underlying,
-
-            "Spot Token":
-                cash_lookup[underlying],
-
-            "Future Token":
-                str(row["token"]),
-
-            "Future Symbol":
-                row["symbol"],
-
-            "Lot Size":
-                int(row["lot_size"]),
-
-            "Expiry":
-                current_expiry
+        stocks.append({
+            "Stock": match,
+            "Spot Symbol": spot["symbol"],
+            "Spot Token": spot["token"],
+            "Future Symbol": str(row["symbol"]),
+            "Future Token": str(row["token"]),
+            "Lot Size": int(row["lot_size"]),
+            "Expiry": nearest
         })
 
-    contracts = pd.DataFrame(
-        contracts
-    )
+    result = pd.DataFrame(stocks)
 
-    if contracts.empty:
-
+    if result.empty:
         raise Exception(
-            "Spot और Future की matching नहीं मिली।"
+            "F&O और Spot matching नहीं मिली"
         )
 
-    # ==============================
-    # Angel Login
-    # ==============================
-
-    jwt = angel_login()
-
-    spot_tokens = (
-        contracts["Spot Token"]
-        .astype(str)
-        .tolist()
+    result = result.drop_duplicates(
+        subset=["Stock"]
     )
 
-    future_tokens = (
-        contracts["Future Token"]
-        .astype(str)
-        .tolist()
+    return result, nearest
+
+
+# ============================================================
+# LTP
+# ============================================================
+
+def get_ltp(
+    jwt,
+    exchange,
+    symbol,
+    token
+):
+
+    headers = HEADERS.copy()
+
+    headers["Authorization"] = (
+        "Bearer " + jwt
     )
 
-    # ==============================
-    # Live prices
-    # ==============================
+    try:
 
-    spot_prices = get_ltp(
-        jwt,
-        "NSE",
-        spot_tokens
+        response = requests.post(
+            BASE_URL +
+            "/rest/secure/angelbroking/order/v1/getLtpData",
+
+            json={
+                "exchange": exchange,
+                "tradingsymbol": symbol,
+                "symboltoken": str(token)
+            },
+
+            headers=headers,
+            timeout=20
+        )
+
+        data = response.json()
+
+        if data.get("status") is True:
+
+            if data.get("data"):
+
+                ltp = data["data"].get("ltp")
+
+                if ltp is not None:
+                    return float(ltp)
+
+    except Exception:
+        return None
+
+    return None
+
+
+# ============================================================
+# SCANNER
+# ============================================================
+
+def scan():
+
+    master = get_master()
+
+    stocks, expiry = prepare_stocks(
+        master
     )
 
-    future_prices = get_ltp(
-        jwt,
-        "NFO",
-        future_tokens
-    )
+    jwt = login_angel()
 
     results = []
 
-    for _, row in contracts.iterrows():
+    progress = st.progress(0)
 
-        spot = spot_prices.get(
-            str(row["Spot Token"])
+    total = len(stocks)
+
+    for number, (_, row) in enumerate(
+        stocks.iterrows(),
+        start=1
+    ):
+
+        spot = get_ltp(
+            jwt,
+            "NSE",
+            row["Spot Symbol"],
+            row["Spot Token"]
         )
 
-        future = future_prices.get(
-            str(row["Future Token"])
+        future = get_ltp(
+            jwt,
+            "NFO",
+            row["Future Symbol"],
+            row["Future Token"]
         )
 
-        if spot is None:
-            continue
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # ONLY FUTURE > SPOT
+        # ----------------------------------------------------
 
-        if future is None:
-            continue
+        if spot is not None and future is not None:
 
-        difference = (
-            spot - future
+            difference = future - spot
+
+            if difference > 0:
+
+                lot = int(
+                    row["Lot Size"]
+                )
+
+                final_value = (
+                    difference * lot
+                )
+
+                results.append({
+
+                    "Stock":
+                        row["Stock"],
+
+                    "Spot":
+                        round(spot, 2),
+
+                    "Current Future":
+                        round(future, 2),
+
+                    "Future − Spot":
+                        round(difference, 2),
+
+                    "Lot Size":
+                        lot,
+
+                    "Difference × Lot":
+                        round(final_value, 2),
+
+                    "Expiry":
+                        row["Expiry"].strftime(
+                            "%d-%b-%Y"
+                        ),
+
+                    "Future Symbol":
+                        row["Future Symbol"]
+                })
+
+        progress.progress(
+            number / total
         )
 
-        value = (
-            difference *
-            row["Lot Size"]
-        )
+        time.sleep(0.06)
 
-        results.append({
+    progress.empty()
 
-            "Stock":
-                row["Stock"],
+    result = pd.DataFrame(results)
 
-            "Spot":
-                round(spot, 2),
+    if result.empty:
+        return result, stocks, expiry
 
-            "Current Future":
-                round(future, 2),
-
-            "Difference":
-                round(difference, 2),
-
-            "Lot Size":
-                row["Lot Size"],
-
-            "Difference × Lot":
-                round(value, 2),
-
-            "Expiry":
-                row["Expiry"].strftime(
-                    "%d-%b-%Y"
-                ),
-
-            "Future":
-                row["Future Symbol"]
-        })
-
-    if not results:
-
-        raise Exception(
-            "Angel One से Spot/Future LTP नहीं मिला।"
-        )
-
-    result = pd.DataFrame(
-        results
-    )
+    # --------------------------------------------------------
+    # HIGHEST FINAL VALUE FIRST
+    # --------------------------------------------------------
 
     result = result.sort_values(
         "Difference × Lot",
         ascending=False
-    )
+    ).reset_index(drop=True)
 
-    result = result.reset_index(
-        drop=True
-    )
+    # --------------------------------------------------------
+    # RANK
+    # --------------------------------------------------------
 
     result.insert(
         0,
@@ -376,11 +502,32 @@ def run_scanner():
         )
     )
 
-    return result, current_expiry
+    # Stock + Lot
+    result["Stock"] = result.apply(
+        lambda x:
+        f"{x['Stock']} ({x['Lot Size']})",
+        axis=1
+    )
 
+    return result, stocks, expiry
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
 
 st.subheader(
     "⚡ Current Month F&O Scanner"
+)
+
+st.markdown(
+    """
+**Filter:** Future > Spot
+
+**Difference:** Future − Spot
+
+**Ranking:** Difference × Lot Size
+"""
 )
 
 if st.button(
@@ -392,43 +539,78 @@ if st.button(
     try:
 
         with st.spinner(
-            "Angel One से live Spot और Future data लिया जा रहा है..."
+            "सभी NSE F&O stocks scan हो रहे हैं..."
         ):
 
-            result, expiry = run_scanner()
+            result, all_stocks, expiry = scan()
 
-        st.success(
-            "✅ Scanner completed"
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Total F&O Stocks",
+            len(all_stocks)
         )
 
-        st.write(
-            "Current Expiry:",
-            expiry.strftime(
-                "%d-%b-%Y"
+        c2.metric(
+            "Future > Spot",
+            len(result)
+        )
+
+        c3.metric(
+            "Expiry",
+            expiry.strftime("%d-%b-%Y")
+        )
+
+        st.divider()
+
+        if result.empty:
+
+            st.warning(
+                "अभी किसी stock का Future > Spot नहीं है।"
             )
-        )
 
-        st.dataframe(
-            result,
-            use_container_width=True,
-            hide_index=True,
-            height=650
-        )
+        else:
 
-        csv = result.to_csv(
-            index=False
-        ).encode("utf-8")
+            st.success(
+                f"✅ {len(result)} stocks मिले"
+            )
 
-        st.download_button(
-            "⬇️ Download CSV",
-            csv,
-            "angel_one_fno_scanner.csv",
-            "text/csv"
-        )
+            st.dataframe(
+                result,
+                use_container_width=True,
+                hide_index=True,
+                height=700
+            )
 
-    except Exception as error:
+            csv = result.to_csv(
+                index=False
+            ).encode("utf-8")
+
+            st.download_button(
+                "⬇️ Download CSV",
+                data=csv,
+                file_name="fno_future_premium.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+    except Exception as e:
 
         st.error(
-            "Scanner Error: " +
-            str(error)
+            "Scanner Error: " + str(e)
         )
+
+        st.exception(e)
+
+else:
+
+    st.write(
+        "🔄 Scan Now दबाकर scanner चलाएँ।"
+    )
+
+st.divider()
+
+st.caption(
+    "Final Formula: (Current Month Future − Spot) × Lot Size"
+)
+```
