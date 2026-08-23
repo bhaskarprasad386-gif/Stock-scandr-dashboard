@@ -621,11 +621,7 @@ def scan_market():
         expiry
     )
 
-return (
-    result,
-    diagnostics,
-    expiry
-)
+
 
 
 # ============================================================
