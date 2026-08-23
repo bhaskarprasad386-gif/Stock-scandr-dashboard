@@ -1,4 +1,4 @@
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 import numpy as np
 import requests
@@ -621,11 +621,15 @@ def scan_market():
         expiry
     )
 
+# ============================================================
+# FAST NIFTY 100 FALL → SIDEWAYS SCANNER
+# ============================================================
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ============================================================
-# NEW NIFTY 100 SCANNER
+# RSI
 # ============================================================
 
 def calculate_rsi(series, period=14):
@@ -655,6 +659,10 @@ def calculate_rsi(series, period=14):
     )
 
 
+# ============================================================
+# OBV
+# ============================================================
+
 def calculate_obv(df):
 
     direction = np.sign(
@@ -665,76 +673,10 @@ def calculate_obv(df):
         direction *
         df["volume"]
     ).cumsum()
-    # ============================================================
-# PRICE FALL + SIDEWAYS CHECK
-# ============================================================
 
-def check_price_structure(df):
-
-    if df is None or len(df) < 30:
-        return False, False, 0
-
-    close = df["close"]
-
-    # हाल के समय से पहले का high
-    previous_high = close.iloc[:-8].max()
-
-    # हाल का low
-    recent_low = close.iloc[-8:].min()
-
-    if previous_high <= 0:
-        return False, False, 0
-
-    fall_percent = (
-        (previous_high - recent_low)
-        / previous_high
-    ) * 100
-
-    # Flexible fall:
-    # कम से कम लगभग 4% गिरावट
-    fall_ok = fall_percent >= 4
-
-    # -----------------------------------------
-    # SIDEWAYS RANGE
-    # -----------------------------------------
-
-    recent = df.iloc[-8:]
-
-    high = recent["high"].max()
-    low = recent["low"].min()
-
-    if low <= 0:
-        return fall_ok, False, fall_percent
-
-    sideways_range = (
-        (high - low) / low
-    ) * 100
-
-    # Flexible sideways condition
-    sideways_ok = sideways_range <= 8
-
-    # किसी एक candle में बहुत बड़ा move नहीं
-    daily_move = (
-        recent["close"]
-        .pct_change()
-        .abs()
-        * 100
-    )
-
-    if (
-        daily_move.dropna().max()
-        > 4
-    ):
-        sideways_ok = False
-
-    return (
-        fall_ok,
-        sideways_ok,
-        fall_percent
-    )
 
 # ============================================================
-# RSI / OBV TREND CHECK
+# RISING CHECK
 # ============================================================
 
 def is_rising(series, lookback=6):
@@ -746,13 +688,11 @@ def is_rising(series, lookback=6):
 
     recent = s.iloc[-lookback:]
 
-    # शुरुआत से अंत तक बढ़ा हो
     overall_rise = (
         recent.iloc[-1]
         > recent.iloc[0]
     )
 
-    # कम से कम 3 बार ऊपर गया हो
     rising_count = (
         recent.diff()
         .dropna()
@@ -766,206 +706,72 @@ def is_rising(series, lookback=6):
     )
 
 
-def get_rsi_obv_signal(df):
-
-    x = df.copy()
-
-    x["RSI"] = calculate_rsi(
-        x["close"]
-    )
-
-    x["OBV"] = calculate_obv(
-        x
-    )
-
-    # RSI rising
-    rsi_rising = is_rising(
-        x["RSI"],
-        6
-    )
-
-    # OBV rising
-    obv_rising = is_rising(
-        x["OBV"],
-        6
-    )
-
-    # -----------------------------------------
-    # SIGNAL
-    # -----------------------------------------
-
-    if rsi_rising and obv_rising:
-
-        signal = "🟢"
-
-        strength = (
-            "RSI + OBV Rising"
-        )
-
-    elif rsi_rising:
-
-        signal = "🟡"
-
-        strength = (
-            "RSI Rising"
-        )
-
-    else:
-
-        signal = ""
-
-        strength = ""
-
-    return (
-        x,
-        rsi_rising,
-        obv_rising,
-        signal,
-        strength
-    )# ============================================================
-# RSI SPECIAL TIMING
+# ============================================================
+# PRICE FALL + SIDEWAYS
 # ============================================================
 
-def get_rsi_timing(df):
+def check_price_structure(df):
 
-    x = df.copy()
+    if df is None or len(df) < 30:
+        return False, False, 0
 
-    if len(x) < 20:
-        return (
-            "Not Enough Data",
-            ""
-        )
+    close = df["close"]
 
-    x["RSI"] = calculate_rsi(
-        x["close"]
+    previous_high = close.iloc[:-8].max()
+
+    recent_low = close.iloc[-8:].min()
+
+    if previous_high <= 0:
+        return False, False, 0
+
+    fall_percent = (
+        (previous_high - recent_low)
+        / previous_high
+    ) * 100
+
+    # कम से कम 4% fall
+    fall_ok = fall_percent >= 4
+
+    # --------------------------------------------------------
+    # SIDEWAYS RANGE
+    # --------------------------------------------------------
+
+    recent = df.iloc[-8:]
+
+    high = recent["high"].max()
+    low = recent["low"].min()
+
+    if low <= 0:
+        return fall_ok, False, fall_percent
+
+    sideways_range = (
+        (high - low) / low
+    ) * 100
+
+    # 8% तक sideways
+    sideways_ok = sideways_range <= 8
+
+    # एक candle में बहुत बड़ा move नहीं
+    daily_move = (
+        recent["close"]
+        .pct_change()
+        .abs()
+        * 100
     )
-
-    # -----------------------------------------
-    # SIDEWAYS START खोजें
-    # -----------------------------------------
-
-    sideways_start = None
-
-    for window in [6, 7, 8, 9, 10, 12]:
-
-        if len(x) < window + 5:
-            continue
-
-        recent = x.iloc[-window:]
-
-        high = recent["high"].max()
-        low = recent["low"].min()
-
-        if low <= 0:
-            continue
-
-        range_percent = (
-            (high - low) / low
-        ) * 100
-
-        moves = (
-            recent["close"]
-            .pct_change()
-            .abs()
-            * 100
-        )
-
-        if (
-            range_percent <= 8
-            and
-            moves.dropna().max() <= 4
-        ):
-            sideways_start = (
-                len(x) - window
-            )
-            break
-
-    if sideways_start is None:
-        return (
-            "Sideways Not Clear",
-            ""
-        )
-
-    # -----------------------------------------
-    # RSI TREND BEFORE SIDEWAYS
-    # -----------------------------------------
-
-    before_start = max(
-        0,
-        sideways_start - 6
-    )
-
-    rsi_before = x[
-        "RSI"
-    ].iloc[
-        before_start:sideways_start
-    ]
-
-    rsi_after = x[
-        "RSI"
-    ].iloc[
-        sideways_start:
-    ]
-
-    before_rising = False
-    after_rising = False
-
-    if len(rsi_before) >= 4:
-
-        before_rising = is_rising(
-            rsi_before,
-            min(
-                5,
-                len(rsi_before)
-            )
-        )
-
-    if len(rsi_after) >= 4:
-
-        after_rising = is_rising(
-            rsi_after,
-            min(
-                6,
-                len(rsi_after)
-            )
-        )
-
-    # -----------------------------------------
-    # SPECIAL TIMING
-    # -----------------------------------------
 
     if (
-        before_rising
+        not daily_move.dropna().empty
         and
-        after_rising
+        daily_move.dropna().max() > 4
     ):
-
-        timing = (
-            "⭐ RSI पहले से Rising"
-        )
-
-        timing_rank = 1
-
-    elif after_rising:
-
-        timing = (
-            "⚡ RSI Sideways Start से Rising"
-        )
-
-        timing_rank = 2
-
-    else:
-
-        timing = (
-            "RSI Rising नहीं"
-        )
-
-        timing_rank = 9
+        sideways_ok = False
 
     return (
-        timing,
-        timing_rank
+        fall_ok,
+        sideways_ok,
+        fall_percent
     )
+
 
 # ============================================================
 # NIFTY 100 LIST
@@ -997,12 +803,12 @@ NIFTY_100 = [
     "ASHOKLEY", "CANBK", "BANKBARODA", "PNB",
     "UNIONBANK", "INDIANB", "BANKINDIA", "LICI",
     "IRFC", "JINDALSTEL", "SAIL", "NHPC",
-    "RECLTD", "IRCTC"
+    "IRCTC"
 ]
 
 
 # ============================================================
-# GET NSE CASH TOKEN MAP
+# TOKEN MAP
 # ============================================================
 
 def get_nifty100_token_map(master):
@@ -1032,10 +838,7 @@ def get_nifty100_token_map(master):
     cash = df[
         (df["exchange"] == "NSE")
         &
-        (
-            df["symbol"]
-            .str.endswith("-EQ")
-        )
+        (df["symbol"].str.endswith("-EQ"))
     ].copy()
 
     token_map = {}
@@ -1056,15 +859,16 @@ def get_nifty100_token_map(master):
             }
 
     return token_map
-    # ============================================================
-# ANGEL ONE HISTORICAL CANDLES
+
+
+# ============================================================
+# HISTORICAL DATA
 # ============================================================
 
-def get_historical_candles(
+def get_historical_candles_fast(
     jwt,
     token,
-    interval,
-    days
+    days=180
 ):
 
     headers = BASE_HEADERS.copy()
@@ -1090,7 +894,7 @@ def get_historical_candles(
     payload = {
         "exchange": "NSE",
         "symboltoken": str(token),
-        "interval": interval,
+        "interval": "ONE_DAY",
         "fromdate": start_date.strftime(
             "%Y-%m-%d %H:%M"
         ),
@@ -1105,7 +909,7 @@ def get_historical_candles(
             url,
             json=payload,
             headers=headers,
-            timeout=30
+            timeout=15
         )
 
         data = response.json()
@@ -1113,9 +917,9 @@ def get_historical_candles(
         if data.get("status") is not True:
             return pd.DataFrame()
 
-        candles = (
-            data.get("data")
-            or []
+        candles = data.get(
+            "data",
+            []
         )
 
         if not candles:
@@ -1133,7 +937,7 @@ def get_historical_candles(
             ]
         )
 
-        for column in [
+        for col in [
             "open",
             "high",
             "low",
@@ -1141,8 +945,8 @@ def get_historical_candles(
             "volume"
         ]:
 
-            df[column] = pd.to_numeric(
-                df[column],
+            df[col] = pd.to_numeric(
+                df[col],
                 errors="coerce"
             )
 
@@ -1156,206 +960,269 @@ def get_historical_candles(
             ]
         )
 
-        df = df.sort_values(
+        return df.sort_values(
             "datetime"
         ).reset_index(
             drop=True
         )
 
-        return df
-
     except Exception:
 
         return pd.DataFrame()
-        # ============================================================
-# NIFTY 100 DAILY + WEEKLY SCAN
+
+
+# ============================================================
+# WEEKLY CONVERSION
 # ============================================================
 
-def scan_nifty100_timeframe(jwt, token_map, timeframe="Daily"):
+def convert_to_weekly(df):
+
+    x = df.copy()
+
+    x["datetime"] = pd.to_datetime(
+        x["datetime"]
+    )
+
+    x = x.set_index(
+        "datetime"
+    )
+
+    weekly = x.resample(
+        "W-FRI"
+    ).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    })
+
+    return weekly.dropna().reset_index()
+
+
+# ============================================================
+# ANALYZE ONE STOCK
+# ============================================================
+
+def analyze_stock(
+    stock,
+    info,
+    jwt,
+    timeframe
+):
+
+    df = get_historical_candles_fast(
+        jwt,
+        info["token"],
+        180
+    )
+
+    if df.empty:
+        return None
+
+    if timeframe == "Weekly":
+
+        df = convert_to_weekly(df)
+
+    if len(df) < 30:
+        return None
+
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
+
+    fall_ok, sideways_ok, fall_percent = (
+        check_price_structure(df)
+    )
+
+    if not fall_ok or not sideways_ok:
+        return None
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    df["RSI"] = calculate_rsi(
+        df["close"]
+    )
+
+    # --------------------------------------------------------
+    # OBV
+    # --------------------------------------------------------
+
+    df["OBV"] = calculate_obv(
+        df
+    )
+
+    rsi_rising = is_rising(
+        df["RSI"],
+        6
+    )
+
+    obv_rising = is_rising(
+        df["OBV"],
+        6
+    )
+
+    # RSI जरूरी
+    if not rsi_rising:
+        return None
+
+    # --------------------------------------------------------
+    # SIGNAL
+    # --------------------------------------------------------
+
+    if rsi_rising and obv_rising:
+
+        signal = "🟢"
+
+        strength = (
+            "RSI + OBV Rising"
+        )
+
+        signal_rank = 1
+
+    else:
+
+        signal = "🟡"
+
+        strength = (
+            "RSI Rising"
+        )
+
+        signal_rank = 2
+
+    # --------------------------------------------------------
+    # CURRENT
+    # --------------------------------------------------------
+
+    price = float(
+        df["close"].iloc[-1]
+    )
+
+    rsi = float(
+        df["RSI"].iloc[-1]
+    )
+
+    # --------------------------------------------------------
+    # RESULT
+    # --------------------------------------------------------
+
+    return {
+        "Signal": signal,
+        "Signal Strength": strength,
+        "Stock": stock,
+        "Price": round(price, 2),
+        "RSI": round(rsi, 2),
+        "RSI Rising": "YES",
+        "OBV Rising":
+            "YES"
+            if obv_rising
+            else "NO",
+        "Price Fall %": round(
+            fall_percent,
+            2
+        ),
+        "Price Phase":
+            "Fall → Sideways",
+        "Timeframe": timeframe,
+        "Signal Rank": signal_rank
+    }
+
+
+# ============================================================
+# FAST SCAN
+# ============================================================
+
+def fast_nifty100_scan(
+    jwt,
+    token_map,
+    timeframe
+):
 
     results = []
 
-    for stock, info in token_map.items():
+    # 12 workers = fast but controlled
+    max_workers = min(
+        12,
+        max(1, len(token_map))
+    )
 
-        # ----------------------------------------------------
-        # Daily data एक बार ही लेना
-        # ----------------------------------------------------
+    with ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
 
-        df = get_historical_candles(
-            jwt,
-            info["token"],
-            "ONE_DAY",
-            120
-        )
-
-        if df.empty or len(df) < 40:
-            continue
-
-        # ----------------------------------------------------
-        # WEEKLY DATA
-        # Daily candles से Weekly बनायेंगे
-        # ----------------------------------------------------
-
-        if timeframe == "Weekly":
-
-            df["datetime"] = pd.to_datetime(
-                df["datetime"]
-            )
-
-            df = df.set_index(
-                "datetime"
-            )
-
-            weekly = df.resample(
-                "W-FRI"
-            ).agg({
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum"
-            })
-
-            df = weekly.dropna().reset_index()
-
-        # ----------------------------------------------------
-        # Minimum data
-        # ----------------------------------------------------
-
-        if len(df) < 30:
-            continue
-
-        # ----------------------------------------------------
-        # PRICE STRUCTURE
-        # ----------------------------------------------------
-
-        fall_ok, sideways_ok, fall_percent = (
-            check_price_structure(df)
-        )
-
-        if not fall_ok or not sideways_ok:
-            continue
-
-        # ----------------------------------------------------
-        # RSI + OBV
-        # ----------------------------------------------------
-
-        (
-            indicator_df,
-            rsi_rising,
-            obv_rising,
-            signal,
-            strength
-        ) = get_rsi_obv_signal(df)
-
-        # RSI rising होना जरूरी
-        if not rsi_rising:
-            continue
-
-        # ----------------------------------------------------
-        # SPECIAL RSI TIMING
-        # ----------------------------------------------------
-
-        timing, timing_rank = get_rsi_timing(
-            df
-        )
-
-        # ----------------------------------------------------
-        # CURRENT VALUES
-        # ----------------------------------------------------
-
-        current_price = float(
-            df["close"].iloc[-1]
-        )
-
-        current_rsi = float(
-            indicator_df["RSI"].iloc[-1]
-        )
-
-        # ----------------------------------------------------
-        # RESULT
-        # ----------------------------------------------------
-
-        results.append({
-
-            "Signal": signal,
-
-            "Signal Strength": strength,
-
-            "Stock": stock,
-
-            "Price": round(
-                current_price,
-                2
-            ),
-
-            "RSI": round(
-                current_rsi,
-                2
-            ),
-
-            "RSI Rising": "YES",
-
-            "OBV Rising":
-                "YES"
-                if obv_rising
-                else "NO",
-
-            "Price Fall %": round(
-                fall_percent,
-                2
-            ),
-
-            "Price Phase":
-                "Fall → Sideways",
-
-            "RSI Timing": timing,
-
-            "Timing Rank":
-                timing_rank,
-
-            "Timeframe":
+        futures = {
+            executor.submit(
+                analyze_stock,
+                stock,
+                info,
+                jwt,
                 timeframe
-        })
+            ): stock
+            for stock, info
+            in token_map.items()
+        }
+
+        for future in as_completed(
+            futures
+        ):
+
+            try:
+
+                result = future.result()
+
+                if result is not None:
+                    results.append(result)
+
+            except Exception:
+                continue
 
     result = pd.DataFrame(
         results
     )
 
-    # --------------------------------------------------------
-    # BEST SETUPS ऊपर
-    # --------------------------------------------------------
+    if result.empty:
+        return result
 
-    if not result.empty:
+    result = result.sort_values(
+        [
+            "Signal Rank",
+            "RSI"
+        ],
+        ascending=[
+            True,
+            False
+        ]
+    ).reset_index(
+        drop=True
+    )
 
-        result = result.sort_values(
-            [
-                "Timing Rank",
-                "Signal"
-            ],
-            ascending=[
-                True,
-                False
-            ]
-        ).reset_index(
-            drop=True
+    result.insert(
+        0,
+        "Rank",
+        range(
+            1,
+            len(result) + 1
         )
+    )
 
-        result.insert(
-            0,
-            "Rank",
-            range(
-                1,
-                len(result) + 1
-            )
-        )
+    result = result.drop(
+        columns=[
+            "Signal Rank"
+        ]
+    )
 
     return result
-    # ============================================================
-# RUN NIFTY 100 SCANNERS
+
+
+# ============================================================
+# RUN ONE TIMEFRAME
 # ============================================================
 
-def run_nifty100_scanners():
+def run_fast_nifty100(
+    timeframe
+):
 
     master = download_master()
 
@@ -1365,172 +1232,20 @@ def run_nifty100_scanners():
 
     if not token_map:
         raise Exception(
-            "Nifty 100 के NSE tokens नहीं मिले"
+            "Nifty 100 tokens नहीं मिले"
         )
 
     jwt = login()
 
-    daily_result = scan_nifty100_timeframe(
+    return fast_nifty100_scan(
         jwt,
         token_map,
-        "Daily"
+        timeframe
     )
 
-    weekly_result = scan_nifty100_timeframe(
-        jwt,
-        token_map,
-        "Weekly"
-    )
-
-    return (
-        daily_result,
-        weekly_result
-    )
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-st.subheader(
-    "⚡ Current Month F&O Scanner"
-)
-
-st.markdown(
-    """
-**Condition:** Current Month Future > Spot
-
-**Difference:** Future − Spot
-
-**Ranking:** (Future − Spot) × Lot Size
-"""
-)
 
 # ============================================================
-# BUTTON
-# ============================================================
-
-if st.button(
-    "🔄 Scan Now",
-    type="primary",
-    use_container_width=True
-):
-
-    try:
-
-        with st.spinner(
-            "Angel One से live data लिया जा रहा है..."
-        ):
-
-            result, diag, expiry = (
-                scan_market()
-            )
-
-        st.success(
-            "✅ Scan पूरा हो गया"
-        )
-
-        # ----------------------------------------------------
-        # DIAGNOSTICS
-        # ----------------------------------------------------
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Total F&O",
-            diag["total"]
-        )
-
-        c2.metric(
-            "Spot LTP",
-            diag["spot"]
-        )
-
-        c3.metric(
-            "Future LTP",
-            diag["future"]
-        )
-
-        c4.metric(
-            "Future > Spot",
-            diag["positive"]
-        )
-
-        st.write(
-            "Current Expiry:",
-            expiry.strftime(
-                "%d-%b-%Y"
-            )
-        )
-
-        st.divider()
-
-        # ----------------------------------------------------
-        # RESULTS
-        # ----------------------------------------------------
-
-        if result.empty:
-
-            st.warning(
-                "Future > Spot वाला कोई stock नहीं मिला।"
-            )
-
-            st.info(
-                "ऊपर Spot LTP और Future LTP counts देखें।"
-            )
-
-        else:
-
-            st.success(
-                f"🎯 {len(result)} stocks मिले"
-            )
-
-            st.dataframe(
-                result,
-                use_container_width=True,
-                hide_index=True,
-                height=700
-            )
-
-            csv = result.to_csv(
-                index=False
-            ).encode("utf-8")
-
-            st.download_button(
-                "⬇️ Download CSV",
-                data=csv,
-                file_name="fno_future_spot.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-
-    except Exception as e:
-
-        st.error(
-            "Scanner Error: " + str(e)
-        )
-
-        st.exception(e)
-
-else:
-
-    st.write(
-        "🔄 Scan Now दबाएँ।"
-    )
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.divider()
-
-st.caption(
-    "Formula: (Current Month Future − Spot) × Lot Size"
-)
-
-st.caption(
-    "Only positive Future − Spot stocks are displayed."
-)
-# ============================================================
-# NIFTY 100 DAILY / WEEKLY SCANNER
+# NIFTY 100 DASHBOARD
 # ============================================================
 
 st.divider()
@@ -1540,140 +1255,127 @@ st.subheader(
 )
 
 st.caption(
-    "Daily और Weekly में Price Fall के बाद "
-    "Sideways + RSI Rising + OBV Rising setups"
+    "Price Fall ≥ 4% → Sideways ≤ 8% → RSI Rising"
 )
 
-daily_tab, weekly_tab = st.tabs(
+# ============================================================
+# TIMEFRAME SELECTOR
+# ============================================================
+
+timeframe = st.radio(
+    "⏱️ Time Frame",
     [
-        "📈 Daily Scanner",
-        "📅 Weekly Scanner"
-    ]
+        "Daily",
+        "Weekly"
+    ],
+    horizontal=True,
+    key="nifty100_timeframe"
 )
 
 # ============================================================
-# DAILY
+# SCAN BUTTON
 # ============================================================
 
-with daily_tab:
+if st.button(
+    f"🔄 Scan Nifty 100 {timeframe}",
+    type="primary",
+    use_container_width=True
+):
 
-    if st.button(
-        "🔄 Scan Nifty 100 Daily",
-        type="primary",
-        use_container_width=True
-    ):
+    try:
 
-        try:
+        with st.spinner(
+            f"⚡ Nifty 100 {timeframe} fast scan चल रहा है..."
+        ):
 
-            with st.spinner(
-                "Nifty 100 Daily scan चल रहा है..."
-            ):
-
-                daily_result, weekly_result = (
-                    run_nifty100_scanners()
-                )
-
-            st.session_state[
-                "nifty100_daily"
-            ] = daily_result
-
-            st.session_state[
-                "nifty100_weekly"
-            ] = weekly_result
-
-            st.success(
-                f"✅ Daily scan complete — "
-                f"{len(daily_result)} stocks मिले"
+            new_result = run_fast_nifty100(
+                timeframe
             )
 
-        except Exception as e:
+        # ----------------------------------------------------
+        # SAVE RESULT
+        # ----------------------------------------------------
 
-            st.error(
-                "Daily Scanner Error: "
-                + str(e)
-            )
+        st.session_state[
+            f"nifty100_{timeframe.lower()}"
+        ] = new_result
 
-    daily_result = st.session_state.get(
-        "nifty100_daily",
-        pd.DataFrame()
+        st.session_state[
+            f"nifty100_{timeframe.lower()}_time"
+        ] = datetime.now(
+            ZoneInfo("Asia/Kolkata")
+        ).strftime(
+            "%d-%b-%Y %H:%M:%S"
+        )
+
+        st.success(
+            f"✅ {timeframe} scan complete — "
+            f"{len(new_result)} stocks मिले"
+        )
+
+    except Exception as e:
+
+        st.error(
+            "Nifty 100 Scanner Error: "
+            + str(e)
+        )
+
+
+# ============================================================
+# SHOW SAVED RESULT
+# ============================================================
+
+saved_result = st.session_state.get(
+    f"nifty100_{timeframe.lower()}",
+    pd.DataFrame()
+)
+
+saved_time = st.session_state.get(
+    f"nifty100_{timeframe.lower()}_time",
+    ""
+)
+
+if saved_time:
+
+    st.caption(
+        f"💾 Last saved {timeframe} result: "
+        f"{saved_time}"
     )
 
-    if not daily_result.empty:
 
-        st.dataframe(
-            daily_result,
-            use_container_width=True,
-            hide_index=True,
-            height=650
-        )
+if not saved_result.empty:
 
-    else:
-
-        st.info(
-            "🔄 Daily Scanner चलाने के लिए "
-            "ऊपर Scan button दबाएँ।"
-        )
-
-
-# ============================================================
-# WEEKLY
-# ============================================================
-
-with weekly_tab:
-
-    if st.button(
-        "🔄 Scan Nifty 100 Weekly",
-        type="primary",
-        use_container_width=True
-    ):
-
-        try:
-
-            with st.spinner(
-                "Nifty 100 Weekly scan चल रहा है..."
-            ):
-
-                daily_result, weekly_result = (
-                    run_nifty100_scanners()
-                )
-
-            st.session_state[
-                "nifty100_daily"
-            ] = daily_result
-
-            st.session_state[
-                "nifty100_weekly"
-            ] = weekly_result
-
-            st.success(
-                f"✅ Weekly scan complete — "
-                f"{len(weekly_result)} stocks मिले"
-            )
-
-        except Exception as e:
-
-            st.error(
-                "Weekly Scanner Error: "
-                + str(e)
-            )
-
-    weekly_result = st.session_state.get(
-        "nifty100_weekly",
-        pd.DataFrame()
+    st.success(
+        f"🎯 {len(saved_result)} stocks मिले"
     )
 
-    if not weekly_result.empty:
+    st.dataframe(
+        saved_result,
+        use_container_width=True,
+        hide_index=True,
+        height=650
+    )
 
-        st.dataframe(
-            weekly_result,
-            use_container_width=True,
-            hide_index=True,
-            height=650
-        )
+    csv = saved_result.to_csv(
+        index=False
+    ).encode("utf-8")
 
-    else:
+    st.download_button(
+        "⬇️ Download CSV",
+        data=csv,
+        file_name=(
+            f"nifty100_{timeframe.lower()}.csv"
+        ),
+        mime="text/csv",
+        use_container_width=True
+    )
 
-        st.info(
-            "🔄 Weekly Scanner चलाने के लिए "
-            "ऊपर Scan button दबाएँ।"
-        )
+else:
+
+    st.info(
+        f"🔄 अभी {timeframe} का result नहीं है। "
+        f"ऊपर Scan button दबाएँ।"
+    )
+
+
+
