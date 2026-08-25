@@ -4,8 +4,11 @@ import pandas as pd
 import numpy as np
 import pyotp
 import time
+import io
+import zipfile
+import re
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -24,16 +27,18 @@ st.title("📊 Fast & Furious Market Scanner")
 
 IST = ZoneInfo("Asia/Kolkata")
 
-BASE_URL = "https://apiconnect.angelone.in"
+ANGEL_BASE = "https://apiconnect.angelone.in"
+
+NSE_BASE = "https://www.nseindia.com"
 
 
 # ============================================================
-# AUTO REFRESH
+# SIDEBAR SETTINGS
 # ============================================================
 
 with st.sidebar:
 
-    st.header("⚙️ Settings")
+    st.header("⚙️ Scanner Settings")
 
     auto_refresh = st.checkbox(
         "🔄 Auto Refresh",
@@ -48,8 +53,10 @@ with st.sidebar:
         step=5
     )
 
+    st.subheader("Parity")
+
     parity_threshold = st.number_input(
-        "Parity Alert Threshold",
+        "Minimum Executable Edge ₹",
         min_value=0.0,
         value=5.0,
         step=0.5
@@ -61,6 +68,60 @@ with st.sidebar:
         max_value=20,
         value=10,
         step=1
+    )
+
+    st.subheader("MTF")
+
+    mtf_own_percent = st.number_input(
+        "Your Own Money %",
+        min_value=1.0,
+        max_value=100.0,
+        value=25.0,
+        step=1.0
+    )
+
+    mtf_broker_percent = (
+        100.0 -
+        mtf_own_percent
+    )
+
+    mtf_interest_daily = st.number_input(
+        "MTF Interest % / Day",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.049,
+        step=0.001,
+        format="%.3f"
+    )
+
+    st.caption(
+        f"Broker funded = {mtf_broker_percent:.1f}%"
+    )
+
+    st.subheader("Rollover")
+
+    rollover_high_percent = st.number_input(
+        "High Rollover %",
+        min_value=50.0,
+        max_value=100.0,
+        value=80.0,
+        step=1.0
+    )
+
+    rollover_cost_high_percent = st.number_input(
+        "High Rollover Cost %",
+        min_value=0.0,
+        max_value=20.0,
+        value=0.50,
+        step=0.05
+    )
+
+    backtest_days = st.number_input(
+        "Backtest Days",
+        min_value=90,
+        max_value=400,
+        value=365,
+        step=30
     )
 
 
@@ -107,10 +168,10 @@ if not TOTP_SECRET:
 
 
 # ============================================================
-# HEADERS
+# ANGEL HEADERS
 # ============================================================
 
-BASE_HEADERS = {
+ANGEL_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
     "X-UserType": "USER",
@@ -181,16 +242,21 @@ NIFTY_50 = [
 
 
 # ============================================================
-# HELPERS
+# TIME
 # ============================================================
 
 def now_ist():
+
     return datetime.now(IST)
 
 
+# ============================================================
+# ANGEL AUTH
+# ============================================================
+
 def auth_headers(jwt):
 
-    h = BASE_HEADERS.copy()
+    h = ANGEL_HEADERS.copy()
 
     h["Authorization"] = (
         "Bearer " + jwt
@@ -203,16 +269,14 @@ def auth_headers(jwt):
 # LOGIN
 # ============================================================
 
-@st.cache_resource(
-    ttl=120
-)
+@st.cache_resource(ttl=120)
 def login():
 
     totp = pyotp.TOTP(
         TOTP_SECRET
     ).now()
 
-    url = BASE_URL + (
+    url = ANGEL_BASE + (
         "/rest/auth/angelbroking/"
         "user/v1/loginByPassword"
     )
@@ -226,7 +290,7 @@ def login():
     r = requests.post(
         url,
         json=payload,
-        headers=BASE_HEADERS,
+        headers=ANGEL_HEADERS,
         timeout=20
     )
 
@@ -272,6 +336,7 @@ def download_master():
     data = r.json()
 
     if not data:
+
         raise Exception(
             "Angel master खाली मिला"
         )
@@ -344,8 +409,6 @@ def prepare_master(master):
 
 # ============================================================
 # FULL QUOTE
-#
-# इसमें LTP + BID + ASK मिलेगा
 # ============================================================
 
 def batch_full_quote(
@@ -365,7 +428,7 @@ def batch_full_quote(
     if not tokens:
         return {}
 
-    url = BASE_URL + (
+    url = ANGEL_BASE + (
         "/rest/secure/angelbroking/"
         "market/v1/quote/"
     )
@@ -406,8 +469,14 @@ def batch_full_quote(
                 continue
 
             fetched = (
-                data.get("data", {})
-                .get("fetched", [])
+                data.get(
+                    "data",
+                    {}
+                )
+                .get(
+                    "fetched",
+                    []
+                )
             )
 
             for item in fetched:
@@ -422,14 +491,11 @@ def batch_full_quote(
                 if not token:
                     continue
 
-                ltp = item.get(
-                    "ltp"
-                )
+                ltp = item.get("ltp")
 
                 bid = None
                 ask = None
 
-                # Angel FULL quote depth
                 depth = item.get(
                     "depth",
                     {}
@@ -446,31 +512,27 @@ def batch_full_quote(
                 )
 
                 if buys:
-
                     bid = buys[0].get(
                         "price"
                     )
 
                 if sells:
-
                     ask = sells[0].get(
                         "price"
                     )
 
-                # fallback
                 if bid is None:
-
                     bid = item.get(
                         "bestBid"
                     )
 
                 if ask is None:
-
                     ask = item.get(
                         "bestAsk"
                     )
 
                 result[token] = {
+
                     "ltp":
                         float(ltp)
                         if ltp is not None
@@ -494,29 +556,6 @@ def batch_full_quote(
 
 
 # ============================================================
-# LTP COMPATIBILITY
-# ============================================================
-
-def batch_ltp(
-    jwt,
-    exchange,
-    tokens
-):
-
-    data = batch_full_quote(
-        jwt,
-        exchange,
-        tokens
-    )
-
-    return {
-        token: x["ltp"]
-        for token, x in data.items()
-        if x.get("ltp") is not None
-    }
-
-
-# ============================================================
 # HISTORICAL
 # ============================================================
 
@@ -524,10 +563,10 @@ def historical(
     jwt,
     token,
     interval="ONE_DAY",
-    days=180
+    days=365
 ):
 
-    url = BASE_URL + (
+    url = ANGEL_BASE + (
         "/rest/secure/angelbroking/"
         "historical/v1/getCandleData"
     )
@@ -542,13 +581,20 @@ def historical(
     )
 
     payload = {
+
         "exchange": "NSE",
-        "symboltoken": str(token),
-        "interval": interval,
+
+        "symboltoken":
+            str(token),
+
+        "interval":
+            interval,
+
         "fromdate":
             start.strftime(
                 "%Y-%m-%d %H:%M"
             ),
+
         "todate":
             end.strftime(
                 "%Y-%m-%d %H:%M"
@@ -561,7 +607,7 @@ def historical(
             url,
             json=payload,
             headers=auth_headers(jwt),
-            timeout=20
+            timeout=25
         )
 
         data = r.json()
@@ -602,21 +648,14 @@ def historical(
                 errors="coerce"
             )
 
-        df = df.dropna(
-            subset=[
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume"
-            ]
-        )
-
         return (
-            df.sort_values(
+            df.dropna()
+            .sort_values(
                 "datetime"
             )
-            .reset_index(drop=True)
+            .reset_index(
+                drop=True
+            )
         )
 
     except Exception:
@@ -663,10 +702,8 @@ def rsi(
 
     return (
         100 -
-        (
-            100 /
-            (1 + rs)
-        )
+        100 /
+        (1 + rs)
     )
 
 
@@ -724,7 +761,7 @@ def rising(
 
 
 # ============================================================
-# PRICE FALL SIDEWAYS
+# FALL SIDEWAYS
 # ============================================================
 
 def price_fall_sideways(df):
@@ -858,20 +895,16 @@ def rsi_before_sideways(df):
     )
 
     if before_yes:
-        return (
-            "⭐ RSI Rising Before Sideways"
-        )
+        return "⭐ RSI Rising Before Sideways"
 
     if after_yes:
-        return (
-            "⚡ RSI Rising During Sideways"
-        )
+        return "⚡ RSI Rising During Sideways"
 
     return "NO"
 
 
 # ============================================================
-# CASH TOKEN MAP
+# CASH MAP
 # ============================================================
 
 def cash_token_map(master):
@@ -898,6 +931,7 @@ def cash_token_map(master):
         )
 
         result[stock] = {
+
             "symbol":
                 row["symbol"],
 
@@ -909,7 +943,7 @@ def cash_token_map(master):
 
 
 # ============================================================
-# RSI SCAN
+# RSI SCANNER
 # ============================================================
 
 def scan_rsi(
@@ -922,7 +956,8 @@ def scan_rsi(
     )
 
     stocks = [
-        s for s in NIFTY_50
+        s
+        for s in NIFTY_50
         if s in tokens
     ]
 
@@ -973,15 +1008,20 @@ def scan_rsi(
 
         return {
 
-            "Stock": stock,
+            "Stock":
+                stock,
 
-            "Price": round(
-                price,
-                2
-            ),
+            "Price":
+                round(
+                    price,
+                    2
+                ),
 
             "20 SMA":
-                round(sma, 2)
+                round(
+                    sma,
+                    2
+                )
                 if sma is not None
                 else None,
 
@@ -991,12 +1031,13 @@ def scan_rsi(
                     sma
                 ),
 
-            "RSI": round(
-                float(
-                    df["RSI"].iloc[-1]
+            "RSI":
+                round(
+                    float(
+                        df["RSI"].iloc[-1]
+                    ),
+                    2
                 ),
-                2
-            ),
 
             "RSI Rising":
                 "YES",
@@ -1036,7 +1077,9 @@ def scan_rsi(
                 result = f.result()
 
                 if result:
-                    rows.append(result)
+                    rows.append(
+                        result
+                    )
 
             except Exception:
                 pass
@@ -1093,7 +1136,7 @@ def current_month_expiry(
         (
             master["expiry_date"] >= today
         )
-    ].copy()
+    ]
 
     if x.empty:
         return None
@@ -1124,7 +1167,7 @@ def current_month_expiry(
 
 
 # ============================================================
-# ALL F&O STOCKS
+# ALL FNO STOCKS
 # ============================================================
 
 def all_fno_stocks(
@@ -1137,17 +1180,18 @@ def all_fno_stocks(
         &
         (master["instrument"] == "FUTSTK")
         &
-        (master["expiry_date"] == expiry)
-    ].copy()
+        (
+            master["expiry_date"]
+            == expiry
+        )
+    ]
 
-    stocks = sorted(
+    return sorted(
         x["name"]
         .dropna()
         .unique()
         .tolist()
     )
-
-    return stocks
 
 
 # ============================================================
@@ -1185,12 +1229,357 @@ def stock_future_map(
 
 
 # ============================================================
-# FUTURE > SPOT
+# CHARGE ENGINE
+# ============================================================
+
+GST = 0.18
+
+ANGEL_EQUITY_BROKERAGE_CAP = 20.0
+ANGEL_EQUITY_BROKERAGE_RATE = 0.001
+ANGEL_EQUITY_MIN_BROKERAGE = 5.0
+
+FNO_BROKERAGE_PER_ORDER = 20.0
+
+NSE_EQUITY_TXN = 0.0000325
+NSE_FUTURE_TXN = 0.0000173
+
+SEBI_PER_CRORE = 10.0
+
+EQUITY_DELIVERY_STT = 0.001
+FUTURE_SELL_STT = 0.0005
+
+STAMP_EQUITY_BUY = 0.00015
+STAMP_FUTURE_BUY = 0.00002
+
+
+def equity_delivery_brokerage(
+    turnover
+):
+
+    if turnover <= 0:
+        return 0.0
+
+    value = min(
+        ANGEL_EQUITY_BROKERAGE_CAP,
+        turnover *
+        ANGEL_EQUITY_BROKERAGE_RATE
+    )
+
+    return max(
+        ANGEL_EQUITY_MIN_BROKERAGE,
+        value
+    )
+
+
+def fno_brokerage():
+
+    return FNO_BROKERAGE_PER_ORDER
+
+
+def sebi_charge(
+    turnover
+):
+
+    return (
+        turnover /
+        10_000_000
+    ) * SEBI_PER_CRORE
+
+
+def gst_on(
+    brokerage,
+    transaction,
+    sebi,
+    other=0
+):
+
+    return (
+        brokerage
+        +
+        transaction
+        +
+        sebi
+        +
+        other
+    ) * GST
+
+
+# ============================================================
+# MTF COST
+# ============================================================
+
+def calculate_mtf_cost(
+    buy_value,
+    sell_value,
+    days,
+    own_percent,
+    daily_interest
+):
+
+    own_money = (
+        buy_value *
+        own_percent /
+        100
+    )
+
+    funded = max(
+        0,
+        buy_value -
+        own_money
+    )
+
+    interest = (
+        funded *
+        daily_interest /
+        100 *
+        max(
+            0,
+            days
+        )
+    )
+
+    buy_brokerage = equity_delivery_brokerage(
+        buy_value
+    )
+
+    sell_brokerage = equity_delivery_brokerage(
+        sell_value
+    )
+
+    buy_txn = (
+        buy_value *
+        NSE_EQUITY_TXN
+    )
+
+    sell_txn = (
+        sell_value *
+        NSE_EQUITY_TXN
+    )
+
+    buy_stt = (
+        buy_value *
+        EQUITY_DELIVERY_STT
+    )
+
+    sell_stt = (
+        sell_value *
+        EQUITY_DELIVERY_STT
+    )
+
+    stamp = (
+        buy_value *
+        STAMP_EQUITY_BUY
+    )
+
+    buy_sebi = sebi_charge(
+        buy_value
+    )
+
+    sell_sebi = sebi_charge(
+        sell_value
+    )
+
+    gst = gst_on(
+        buy_brokerage +
+        sell_brokerage,
+        buy_txn +
+        sell_txn,
+        buy_sebi +
+        sell_sebi
+    )
+
+    total_charges = (
+        interest
+        +
+        buy_brokerage
+        +
+        sell_brokerage
+        +
+        buy_txn
+        +
+        sell_txn
+        +
+        buy_stt
+        +
+        sell_stt
+        +
+        stamp
+        +
+        buy_sebi
+        +
+        sell_sebi
+        +
+        gst
+    )
+
+    return {
+
+        "Own Capital":
+            own_money,
+
+        "Broker Funded":
+            funded,
+
+        "MTF Interest":
+            interest,
+
+        "Equity Brokerage":
+            buy_brokerage +
+            sell_brokerage,
+
+        "Equity STT":
+            buy_stt +
+            sell_stt,
+
+        "Transaction Charges":
+            buy_txn +
+            sell_txn,
+
+        "Stamp Duty":
+            stamp,
+
+        "SEBI Charges":
+            buy_sebi +
+            sell_sebi,
+
+        "GST":
+            gst,
+
+        "Total MTF + Charges":
+            total_charges
+    }
+
+
+# ============================================================
+# FUTURE MARGIN ESTIMATE
+# ============================================================
+
+def estimated_future_margin(
+    future_price,
+    lot_size
+):
+
+    if future_price is None:
+        return None
+
+    if lot_size is None:
+        return None
+
+    contract_value = (
+        float(future_price)
+        *
+        int(lot_size)
+    )
+
+    # Conservative estimate.
+    # Actual SPAN + exposure can differ.
+
+    margin = (
+        contract_value *
+        0.15
+    )
+
+    return round(
+        margin,
+        2
+    )
+
+
+# ============================================================
+# FUTURE SELL COST
+# ============================================================
+
+def calculate_future_sell_cost(
+    future_sell_price,
+    lot_size
+):
+
+    turnover = (
+        future_sell_price *
+        lot_size
+    )
+
+    brokerage = fno_brokerage()
+
+    transaction = (
+        turnover *
+        NSE_FUTURE_TXN
+    )
+
+    stt = (
+        turnover *
+        FUTURE_SELL_STT
+    )
+
+    sebi = sebi_charge(
+        turnover
+    )
+
+    gst = gst_on(
+        brokerage,
+        transaction,
+        sebi
+    )
+
+    stamp = (
+        turnover *
+        STAMP_FUTURE_BUY
+    )
+
+    total = (
+        brokerage
+        +
+        transaction
+        +
+        stt
+        +
+        sebi
+        +
+        gst
+        +
+        stamp
+    )
+
+    return {
+
+        "Future Margin":
+            estimated_future_margin(
+                future_sell_price,
+                lot_size
+            ),
+
+        "Future Brokerage":
+            brokerage,
+
+        "Future STT":
+            stt,
+
+        "Future Transaction":
+            transaction,
+
+        "Future SEBI":
+            sebi,
+
+        "Future Stamp":
+            stamp,
+
+        "Future GST":
+            gst,
+
+        "Future Total Charges":
+            total
+    }
+
+
+# ============================================================
+# FUTURE > SPOT WITH COMPLETE COST
 # ============================================================
 
 def scan_future_spot(
     jwt,
-    master
+    master,
+    own_percent,
+    daily_interest
 ):
 
     expiry = current_month_expiry(
@@ -1211,7 +1600,8 @@ def scan_future_spot(
     )
 
     stocks = [
-        s for s in fmap
+        s
+        for s in fmap
         if s in spot_map
     ]
 
@@ -1241,6 +1631,18 @@ def scan_future_spot(
 
     rows = []
 
+    today = pd.Timestamp(
+        now_ist().date()
+    )
+
+    days_to_expiry = max(
+        1,
+        (
+            expiry -
+            today
+        ).days
+    )
+
     for stock in stocks:
 
         spot_token = (
@@ -1261,19 +1663,19 @@ def scan_future_spot(
             {}
         )
 
-        spot = spot_q.get(
-            "ltp"
-        )
+        spot = spot_q.get("ltp")
+        future = future_q.get("ltp")
 
-        future = future_q.get(
-            "ltp"
-        )
-
-        if spot is None or future is None:
+        if (
+            spot is None
+            or
+            future is None
+        ):
             continue
 
         difference = (
-            future - spot
+            future -
+            spot
         )
 
         if difference <= 0:
@@ -1283,9 +1685,60 @@ def scan_future_spot(
             fmap[stock]["lot_size"]
         )
 
-        profit = (
-            difference * lot
+        spot_buy_value = (
+            spot *
+            lot
         )
+
+        future_sell_value = (
+            future *
+            lot
+        )
+
+        gross_profit = (
+            difference *
+            lot
+        )
+
+        mtf = calculate_mtf_cost(
+            spot_buy_value,
+            spot_buy_value,
+            days_to_expiry,
+            own_percent,
+            daily_interest
+        )
+
+        future_cost = calculate_future_sell_cost(
+            future,
+            lot
+        )
+
+        total_cost = (
+            mtf["Total MTF + Charges"]
+            +
+            future_cost[
+                "Future Total Charges"
+            ]
+        )
+
+        net_profit = (
+            gross_profit -
+            total_cost
+        )
+
+        own_capital = (
+            mtf["Own Capital"]
+            +
+            future_cost[
+                "Future Margin"
+            ]
+        )
+
+        roi = (
+            net_profit /
+            own_capital *
+            100
+        ) if own_capital > 0 else 0
 
         rows.append({
 
@@ -1293,15 +1746,18 @@ def scan_future_spot(
                 stock,
 
             "Spot":
-                round(spot, 2),
+                round(
+                    spot,
+                    2
+                ),
 
             "Future":
-                round(future, 2),
+                round(
+                    future,
+                    2
+                ),
 
-            "Future > Spot":
-                "YES",
-
-            "Difference":
+            "Spread":
                 round(
                     difference,
                     2
@@ -1310,9 +1766,68 @@ def scan_future_spot(
             "Lot Size":
                 lot,
 
-            "Difference × Lot":
+            "Spot Buy Value":
                 round(
-                    profit,
+                    spot_buy_value,
+                    2
+                ),
+
+            "MTF Own Money":
+                round(
+                    mtf["Own Capital"],
+                    2
+                ),
+
+            "Broker Funding":
+                round(
+                    mtf["Broker Funded"],
+                    2
+                ),
+
+            "Days To Expiry":
+                days_to_expiry,
+
+            "MTF Interest":
+                round(
+                    mtf["MTF Interest"],
+                    2
+                ),
+
+            "Future Margin":
+                round(
+                    future_cost[
+                        "Future Margin"
+                    ],
+                    2
+                ),
+
+            "Gross Profit":
+                round(
+                    gross_profit,
+                    2
+                ),
+
+            "Total Charges":
+                round(
+                    total_cost,
+                    2
+                ),
+
+            "Net Profit":
+                round(
+                    net_profit,
+                    2
+                ),
+
+            "Own Capital Required":
+                round(
+                    own_capital,
+                    2
+                ),
+
+            "ROI on Own Capital %":
+                round(
+                    roi,
                     2
                 ),
 
@@ -1329,7 +1844,7 @@ def scan_future_spot(
     if not result.empty:
 
         result = result.sort_values(
-            "Difference × Lot",
+            "Net Profit",
             ascending=False
         ).reset_index(
             drop=True
@@ -1401,6 +1916,7 @@ def stock_option_map(
                 typ
             )
         ] = {
+
             "token":
                 str(row["token"]),
 
@@ -1412,38 +1928,260 @@ def stock_option_map(
 
 
 # ============================================================
-# ESTIMATED MARGIN
+# PARITY COST
 # ============================================================
 
-def estimated_margin(
-    future,
-    lot_size
+def calculate_parity_cost(
+    future_price,
+    strike,
+    ce_price,
+    pe_price,
+    lot_size,
+    side,
+    days_to_expiry
 ):
 
-    # conservative rough estimate
-    # actual Angel RMS margin can differ
+    # --------------------------------------------------------
+    # Four legs:
+    #
+    # Positive:
+    # Sell CE
+    # Buy PE
+    # Buy Future
+    #
+    # Negative:
+    # Buy CE
+    # Sell PE
+    # Sell Future
+    #
+    # This is an ESTIMATE.
+    # Exact exchange/broker charges depend on execution.
+    # --------------------------------------------------------
 
-    if future is None:
-        return None
+    if side == "POSITIVE":
 
-    try:
+        ce_sell = ce_price
+        pe_buy = pe_price
+        future_buy = future_price
 
-        margin = (
-            float(future)
-            *
-            int(lot_size)
-            *
-            0.15
+        gross = (
+            ce_sell
+            -
+            pe_buy
+            -
+            (
+                future_buy -
+                strike
+            )
+        ) * lot_size
+
+        ce_turnover = (
+            ce_sell *
+            lot_size
         )
 
-        return round(
-            margin,
-            2
+        pe_turnover = (
+            pe_buy *
+            lot_size
         )
 
-    except Exception:
+        future_turnover = (
+            future_buy *
+            lot_size
+        )
 
-        return None
+    else:
+
+        ce_buy = ce_price
+        pe_sell = pe_price
+        future_sell = future_price
+
+        gross = (
+            (
+                future_sell -
+                strike
+            )
+            -
+            (
+                ce_buy -
+                pe_sell
+            )
+        ) * lot_size
+
+        ce_turnover = (
+            ce_buy *
+            lot_size
+        )
+
+        pe_turnover = (
+            pe_sell *
+            lot_size
+        )
+
+        future_turnover = (
+            future_sell *
+            lot_size
+        )
+
+    # --------------------------------------------------------
+    # F&O BROKERAGE
+    # --------------------------------------------------------
+
+    brokerage = (
+        FNO_BROKERAGE_PER_ORDER
+        *
+        3
+    )
+
+    # --------------------------------------------------------
+    # TRANSACTION CHARGES
+    # --------------------------------------------------------
+
+    txn = (
+        ce_turnover
+        +
+        pe_turnover
+        +
+        future_turnover
+    ) * NSE_FUTURE_TXN
+
+    # --------------------------------------------------------
+    # STT
+    #
+    # Option sale only
+    # Future sale only
+    # --------------------------------------------------------
+
+    if side == "POSITIVE":
+
+        option_stt = (
+            ce_turnover *
+            0.0015
+        )
+
+        future_stt = 0
+
+    else:
+
+        option_stt = (
+            pe_turnover *
+            0.0015
+        )
+
+        future_stt = (
+            future_turnover *
+            FUTURE_SELL_STT
+        )
+
+    sebi = sebi_charge(
+        ce_turnover
+        +
+        pe_turnover
+        +
+        future_turnover
+    )
+
+    stamp = (
+        (
+            ce_turnover
+            +
+            pe_turnover
+            +
+            future_turnover
+        )
+        *
+        0.00002
+    )
+
+    gst = gst_on(
+        brokerage,
+        txn,
+        sebi
+    )
+
+    total_charges = (
+        brokerage
+        +
+        txn
+        +
+        option_stt
+        +
+        future_stt
+        +
+        sebi
+        +
+        stamp
+        +
+        gst
+    )
+
+    future_margin = estimated_future_margin(
+        future_price,
+        lot_size
+    )
+
+    # Option margin approximation.
+    # Since parity consists of option + future legs,
+    # actual SPAN may offset significantly.
+    option_margin_estimate = (
+        (
+            ce_price +
+            pe_price
+        )
+        *
+        lot_size
+    )
+
+    estimated_total_margin = (
+        future_margin
+        +
+        option_margin_estimate
+    )
+
+    net = (
+        gross -
+        total_charges
+    )
+
+    return {
+
+        "Gross Profit":
+            gross,
+
+        "Total Charges":
+            total_charges,
+
+        "Net Profit":
+            net,
+
+        "Future Margin":
+            future_margin,
+
+        "Option Premium Value":
+            option_margin_estimate,
+
+        "Estimated Total Margin":
+            estimated_total_margin,
+
+        "Brokerage":
+            brokerage,
+
+        "STT":
+            option_stt +
+            future_stt,
+
+        "Transaction Charges":
+            txn,
+
+        "SEBI":
+            sebi,
+
+        "Stamp":
+            stamp,
+
+        "GST":
+            gst
+    }
 
 
 # ============================================================
@@ -1464,14 +2202,15 @@ def parity_direction(
 
 
 # ============================================================
-# ALL F&O STOCK PARITY
+# STOCK PARITY MASTER SCANNER
 # ============================================================
 
-def scan_all_stock_parity(
+def scan_stock_parity_part(
     jwt,
     master,
-    strike_count=10,
-    threshold=5
+    strike_count,
+    threshold,
+    part
 ):
 
     expiry = current_month_expiry(
@@ -1492,16 +2231,35 @@ def scan_all_stock_parity(
         expiry
     )
 
+    stocks = [
+        s
+        for s in stocks
+        if s in fmap
+    ]
+
     # --------------------------------------------------------
-    # FUTURES QUOTE IN BATCH
+    # SPLIT INTO 3 INDEPENDENT PARTS
     # --------------------------------------------------------
+
+    chunks = np.array_split(
+        stocks,
+        3
+    )
+
+    stocks = list(
+        chunks[
+            part - 1
+        ]
+    )
+
+    if not stocks:
+        return pd.DataFrame()
 
     future_tokens = [
         str(
             fmap[s]["token"]
         )
         for s in stocks
-        if s in fmap
     ]
 
     future_quotes = batch_full_quote(
@@ -1512,14 +2270,19 @@ def scan_all_stock_parity(
 
     rows = []
 
-    # --------------------------------------------------------
-    # PROCESS STOCKS
-    # --------------------------------------------------------
+    today = pd.Timestamp(
+        now_ist().date()
+    )
+
+    days_to_expiry = max(
+        1,
+        (
+            expiry -
+            today
+        ).days
+    )
 
     for stock in stocks:
-
-        if stock not in fmap:
-            continue
 
         future_row = fmap[
             stock
@@ -1566,7 +2329,6 @@ def scan_all_stock_parity(
             )
         )
 
-        # nearest strikes to FUTURE
         strikes = sorted(
             strikes,
             key=lambda x:
@@ -1599,9 +2361,6 @@ def scan_all_stock_parity(
                         item["token"]
                     )
 
-        if not tokens:
-            continue
-
         quotes = batch_full_quote(
             jwt,
             "NFO",
@@ -1609,12 +2368,9 @@ def scan_all_stock_parity(
         )
 
         lot_size = int(
-            future_row["lot_size"]
-        )
-
-        margin = estimated_margin(
-            future_ltp,
-            lot_size
+            future_row[
+                "lot_size"
+            ]
         )
 
         for strike in strikes:
@@ -1633,7 +2389,11 @@ def scan_all_stock_parity(
                 )
             )
 
-            if not ce_item or not pe_item:
+            if (
+                not ce_item
+                or
+                not pe_item
+            ):
                 continue
 
             ce_q = quotes.get(
@@ -1646,29 +2406,14 @@ def scan_all_stock_parity(
                 {}
             )
 
-            ce_ltp = ce_q.get(
-                "ltp"
-            )
+            ce_ltp = ce_q.get("ltp")
+            pe_ltp = pe_q.get("ltp")
 
-            pe_ltp = pe_q.get(
-                "ltp"
-            )
+            ce_bid = ce_q.get("bid")
+            ce_ask = ce_q.get("ask")
 
-            ce_bid = ce_q.get(
-                "bid"
-            )
-
-            ce_ask = ce_q.get(
-                "ask"
-            )
-
-            pe_bid = pe_q.get(
-                "bid"
-            )
-
-            pe_ask = pe_q.get(
-                "ask"
-            )
+            pe_bid = pe_q.get("bid")
+            pe_ask = pe_q.get("ask")
 
             if (
                 ce_ltp is None
@@ -1677,34 +2422,24 @@ def scan_all_stock_parity(
             ):
                 continue
 
-            # ------------------------------------------------
-            # LTP PARITY
-            # ------------------------------------------------
-
-            parity_ltp = (
+            ltp_parity = (
                 ce_ltp
                 -
                 pe_ltp
                 -
                 (
-                    future_ltp
-                    -
+                    future_ltp -
                     strike
                 )
             )
 
-            # ------------------------------------------------
-            # EXECUTABLE BID/ASK PARITY
-            #
-            # Positive edge:
-            # Sell expensive CE/Buy PE etc.
-            #
-            # Negative edge:
-            # reverse side
-            # ------------------------------------------------
+            positive = None
+            negative = None
 
-            executable_positive = None
-            executable_negative = None
+            # Positive:
+            # Sell CE at bid
+            # Buy PE at ask
+            # Buy Future at ask
 
             if (
                 ce_bid is not None
@@ -1714,17 +2449,21 @@ def scan_all_stock_parity(
                 future_ask is not None
             ):
 
-                executable_positive = (
+                positive = (
                     ce_bid
                     -
                     pe_ask
                     -
                     (
-                        future_ask
-                        -
+                        future_ask -
                         strike
                     )
                 )
+
+            # Negative:
+            # Buy CE at ask
+            # Sell PE at bid
+            # Sell Future at bid
 
             if (
                 ce_ask is not None
@@ -1734,73 +2473,79 @@ def scan_all_stock_parity(
                 future_bid is not None
             ):
 
-                executable_negative = (
-                    ce_ask
-                    -
-                    pe_bid
+                negative = (
+                    (
+                        future_bid -
+                        strike
+                    )
                     -
                     (
-                        future_bid
-                        -
-                        strike
+                        ce_ask -
+                        pe_bid
                     )
                 )
 
-            # choose strongest executable direction
-
             candidates = []
 
-            if (
-                executable_positive
-                is not None
-            ):
-
+            if positive is not None:
                 candidates.append(
                     (
-                        executable_positive,
+                        positive,
                         "POSITIVE"
                     )
                 )
 
-            if (
-                executable_negative
-                is not None
-            ):
-
+            if negative is not None:
                 candidates.append(
                     (
-                        executable_negative,
+                        negative,
                         "NEGATIVE"
                     )
                 )
 
-            if candidates:
+            if not candidates:
+                continue
 
-                best_value, best_side = max(
-                    candidates,
-                    key=lambda x:
-                        abs(x[0])
+            best_value, best_side = max(
+                candidates,
+                key=lambda x:
+                    abs(x[0])
+            )
+
+            if abs(best_value) <= threshold:
+                continue
+
+            if best_side == "POSITIVE":
+
+                calc = calculate_parity_cost(
+                    future_ask,
+                    strike,
+                    ce_bid,
+                    pe_ask,
+                    lot_size,
+                    "POSITIVE",
+                    days_to_expiry
                 )
 
             else:
 
-                best_value = parity_ltp
-                best_side = (
-                    "POSITIVE"
-                    if parity_ltp > 0
-                    else "NEGATIVE"
+                calc = calculate_parity_cost(
+                    future_bid,
+                    strike,
+                    ce_ask,
+                    pe_bid,
+                    lot_size,
+                    "NEGATIVE",
+                    days_to_expiry
                 )
-
-            if abs(
-                best_value
-            ) <= threshold:
-
-                continue
 
             rows.append({
 
                 "Stock":
                     stock,
+
+                "Part":
+                    f"Part {part}",
 
                 "Direction":
                     parity_direction(
@@ -1828,10 +2573,7 @@ def scan_all_stock_parity(
                     future_ask,
 
                 "Strike":
-                    round(
-                        strike,
-                        2
-                    ),
+                    strike,
 
                 "CE":
                     round(
@@ -1859,7 +2601,7 @@ def scan_all_stock_parity(
 
                 "LTP Parity":
                     round(
-                        parity_ltp,
+                        ltp_parity,
                         2
                     ),
 
@@ -1878,14 +2620,81 @@ def scan_all_stock_parity(
                 "Lot Size":
                     lot_size,
 
-                "Estimated Margin":
-                    margin,
-
-                "Potential / Lot":
+                "Gross Profit":
                     round(
-                        abs(best_value)
-                        *
-                        lot_size,
+                        calc[
+                            "Gross Profit"
+                        ],
+                        2
+                    ),
+
+                "Total Charges":
+                    round(
+                        calc[
+                            "Total Charges"
+                        ],
+                        2
+                    ),
+
+                "Net Profit":
+                    round(
+                        calc[
+                            "Net Profit"
+                        ],
+                        2
+                    ),
+
+                "Future Margin":
+                    round(
+                        calc[
+                            "Future Margin"
+                        ],
+                        2
+                    ),
+
+                "Option Value":
+                    round(
+                        calc[
+                            "Option Premium Value"
+                        ],
+                        2
+                    ),
+
+                "Estimated Margin":
+                    round(
+                        calc[
+                            "Estimated Total Margin"
+                        ],
+                        2
+                    ),
+
+                "Brokerage":
+                    round(
+                        calc[
+                            "Brokerage"
+                        ],
+                        2
+                    ),
+
+                "STT":
+                    round(
+                        calc[
+                            "STT"
+                        ],
+                        2
+                    ),
+
+                "Transaction":
+                    round(
+                        calc[
+                            "Transaction Charges"
+                        ],
+                        2
+                    ),
+
+                "GST":
+                    round(
+                        calc["GST"],
                         2
                     )
             })
@@ -1897,7 +2706,7 @@ def scan_all_stock_parity(
     if not result.empty:
 
         result = result.sort_values(
-            "Absolute Edge",
+            "Net Profit",
             ascending=False
         ).reset_index(
             drop=True
@@ -1916,7 +2725,7 @@ def scan_all_stock_parity(
 
 
 # ============================================================
-# INDEX HELPERS
+# INDEX PARITY
 # ============================================================
 
 def find_index_name(
@@ -1943,16 +2752,12 @@ def find_index_name(
     return None
 
 
-# ============================================================
-# INDEX PARITY
-# ============================================================
-
 def scan_index_parity(
     jwt,
     master,
     index_label,
-    strike_count=10,
-    threshold=5
+    strike_count,
+    threshold
 ):
 
     possible_names = {
@@ -1967,14 +2772,12 @@ def scan_index_parity(
             ["SENSEX"]
     }
 
-    if index_label not in possible_names:
-        return pd.DataFrame()
-
     name = find_index_name(
         master,
-        possible_names[
-            index_label
-        ]
+        possible_names.get(
+            index_label,
+            []
+        )
     )
 
     if name is None:
@@ -1997,17 +2800,19 @@ def scan_index_parity(
             master["expiry_date"]
             == expiry
         )
-    ].copy()
-
-    if x.empty:
-        return pd.DataFrame()
+    ]
 
     futures = x[
         x["instrument"]
         == "FUTIDX"
     ]
 
-    if futures.empty:
+    options = x[
+        x["instrument"]
+        == "OPTIDX"
+    ]
+
+    if futures.empty or options.empty:
         return pd.DataFrame()
 
     future_row = futures.iloc[0]
@@ -2016,7 +2821,7 @@ def scan_index_parity(
         future_row["token"]
     )
 
-    future_quote = batch_full_quote(
+    fq = batch_full_quote(
         jwt,
         "NFO",
         [future_token]
@@ -2025,34 +2830,12 @@ def scan_index_parity(
         {}
     )
 
-    future_ltp = future_quote.get(
-        "ltp"
-    )
+    future = fq.get("ltp")
+    future_bid = fq.get("bid")
+    future_ask = fq.get("ask")
 
-    future_bid = future_quote.get(
-        "bid"
-    )
-
-    future_ask = future_quote.get(
-        "ask"
-    )
-
-    if future_ltp is None:
+    if future is None:
         return pd.DataFrame()
-
-    options = x[
-        x["instrument"]
-        == "OPTIDX"
-    ].copy()
-
-    if options.empty:
-        return pd.DataFrame()
-
-    options = options[
-        options["symbol"].str.endswith(
-            ("CE", "PE")
-        )
-    ]
 
     strikes = sorted(
         set(
@@ -2064,10 +2847,10 @@ def scan_index_parity(
 
     strikes = sorted(
         strikes,
-        key=lambda s:
+        key=lambda x:
             abs(
-                s -
-                future_ltp
+                x -
+                future
             )
     )[
         :int(strike_count)
@@ -2092,6 +2875,10 @@ def scan_index_parity(
     )
 
     rows = []
+
+    lot_size = int(
+        future_row["lot_size"]
+    )
 
     for strike in strikes:
 
@@ -2138,45 +2925,23 @@ def scan_index_parity(
             {}
         )
 
-        ce_ltp = ce_q.get(
-            "ltp"
-        )
+        ce = ce_q.get("ltp")
+        pe = pe_q.get("ltp")
 
-        pe_ltp = pe_q.get(
-            "ltp"
-        )
+        ce_bid = ce_q.get("bid")
+        ce_ask = ce_q.get("ask")
 
-        ce_bid = ce_q.get(
-            "bid"
-        )
+        pe_bid = pe_q.get("bid")
+        pe_ask = pe_q.get("ask")
 
-        ce_ask = ce_q.get(
-            "ask"
-        )
-
-        pe_bid = pe_q.get(
-            "bid"
-        )
-
-        pe_ask = pe_q.get(
-            "ask"
-        )
-
-        if (
-            ce_ltp is None
-            or
-            pe_ltp is None
-        ):
+        if ce is None or pe is None:
             continue
 
-        parity_ltp = (
-            ce_ltp
-            -
-            pe_ltp
-            -
+        ltp_parity = (
+            ce -
+            pe -
             (
-                future_ltp
-                -
+                future -
                 strike
             )
         )
@@ -2198,8 +2963,7 @@ def scan_index_parity(
                 pe_ask
                 -
                 (
-                    future_ask
-                    -
+                    future_ask -
                     strike
                 )
             )
@@ -2213,14 +2977,14 @@ def scan_index_parity(
         ):
 
             negative = (
-                ce_ask
-                -
-                pe_bid
+                (
+                    future_bid -
+                    strike
+                )
                 -
                 (
-                    future_bid
-                    -
-                    strike
+                    ce_ask -
+                    pe_bid
                 )
             )
 
@@ -2228,25 +2992,55 @@ def scan_index_parity(
 
         if positive is not None:
             candidates.append(
-                positive
+                (
+                    positive,
+                    "POSITIVE"
+                )
             )
 
         if negative is not None:
             candidates.append(
-                negative
+                (
+                    negative,
+                    "NEGATIVE"
+                )
             )
 
-        best = (
-            max(
-                candidates,
-                key=abs
-            )
-            if candidates
-            else parity_ltp
+        if not candidates:
+            continue
+
+        best, side = max(
+            candidates,
+            key=lambda x:
+                abs(x[0])
         )
 
         if abs(best) <= threshold:
             continue
+
+        if side == "POSITIVE":
+
+            calc = calculate_parity_cost(
+                future_ask,
+                strike,
+                ce_bid,
+                pe_ask,
+                lot_size,
+                "POSITIVE",
+                1
+            )
+
+        else:
+
+            calc = calculate_parity_cost(
+                future_bid,
+                strike,
+                ce_ask,
+                pe_bid,
+                lot_size,
+                "NEGATIVE",
+                1
+            )
 
         rows.append({
 
@@ -2258,6 +3052,9 @@ def scan_index_parity(
                     best
                 ),
 
+            "Side":
+                side,
+
             "Expiry":
                 expiry.strftime(
                     "%d-%b-%Y"
@@ -2265,7 +3062,7 @@ def scan_index_parity(
 
             "Future":
                 round(
-                    future_ltp,
+                    future,
                     2
                 ),
 
@@ -2276,16 +3073,10 @@ def scan_index_parity(
                 future_ask,
 
             "Strike":
-                round(
-                    strike,
-                    2
-                ),
+                strike,
 
             "CE":
-                round(
-                    ce_ltp,
-                    2
-                ),
+                ce,
 
             "CE Bid":
                 ce_bid,
@@ -2294,10 +3085,7 @@ def scan_index_parity(
                 ce_ask,
 
             "PE":
-                round(
-                    pe_ltp,
-                    2
-                ),
+                pe,
 
             "PE Bid":
                 pe_bid,
@@ -2307,7 +3095,7 @@ def scan_index_parity(
 
             "LTP Parity":
                 round(
-                    parity_ltp,
+                    ltp_parity,
                     2
                 ),
 
@@ -2317,11 +3105,40 @@ def scan_index_parity(
                     2
                 ),
 
-            "Absolute Edge":
+            "Gross Profit":
                 round(
-                    abs(best),
+                    calc[
+                        "Gross Profit"
+                    ],
                     2
-                )
+                ),
+
+            "Total Charges":
+                round(
+                    calc[
+                        "Total Charges"
+                    ],
+                    2
+                ),
+
+            "Net Profit":
+                round(
+                    calc[
+                        "Net Profit"
+                    ],
+                    2
+                ),
+
+            "Estimated Margin":
+                round(
+                    calc[
+                        "Estimated Total Margin"
+                    ],
+                    2
+                ),
+
+            "Lot Size":
+                lot_size
         })
 
     result = pd.DataFrame(
@@ -2331,7 +3148,7 @@ def scan_index_parity(
     if not result.empty:
 
         result = result.sort_values(
-            "Absolute Edge",
+            "Net Profit",
             ascending=False
         ).reset_index(
             drop=True
@@ -2345,6 +3162,902 @@ def scan_index_parity(
                 len(result) + 1
             )
         )
+
+    return result
+
+
+# ============================================================
+# NSE FREE SOURCE
+# ============================================================
+
+@st.cache_data(
+    ttl=300,
+    show_spinner=False
+)
+def nse_session():
+
+    s = requests.Session()
+
+    headers = {
+        "User-Agent":
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/131.0 Safari/537.36",
+
+        "Accept":
+            "application/json,text/plain,*/*",
+
+        "Accept-Language":
+            "en-US,en;q=0.9",
+
+        "Referer":
+            "https://www.nseindia.com/"
+    }
+
+    try:
+
+        s.get(
+            NSE_BASE,
+            headers=headers,
+            timeout=20
+        )
+
+        return s, headers
+
+    except Exception:
+
+        return None, headers
+
+
+def nse_json(
+    path,
+    params=None
+):
+
+    s, headers = nse_session()
+
+    if s is None:
+        return None
+
+    try:
+
+        r = s.get(
+            NSE_BASE + path,
+            params=params,
+            headers=headers,
+            timeout=20
+        )
+
+        if r.status_code != 200:
+            return None
+
+        return r.json()
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# NSE CURRENT DERIVATIVE DATA
+# ============================================================
+
+@st.cache_data(
+    ttl=120,
+    show_spinner=False
+)
+def nse_derivative_quote(
+    symbol
+):
+
+    data = nse_json(
+        "/api/quote-derivative",
+        {
+            "symbol": symbol
+        }
+    )
+
+    if not data:
+        return {}
+
+    return data
+
+
+# ============================================================
+# ROLLOVER EXTRACTION
+# ============================================================
+
+def parse_rollover_from_nse(
+    data,
+    symbol
+):
+
+    if not data:
+        return None
+
+    rows = []
+
+    # NSE responses can change structure.
+    # Search recursively for contract records.
+
+    def walk(obj):
+
+        if isinstance(obj, dict):
+
+            keys = {
+                str(k).lower()
+                for k in obj.keys()
+            }
+
+            if (
+                "openinterest" in keys
+                or
+                "oi" in keys
+            ):
+
+                rows.append(obj)
+
+            for value in obj.values():
+                walk(value)
+
+        elif isinstance(obj, list):
+
+            for item in obj:
+                walk(item)
+
+    try:
+        walk(data)
+    except Exception:
+        pass
+
+    if not rows:
+        return None
+
+    parsed = []
+
+    for row in rows:
+
+        expiry = (
+            row.get("expiryDate")
+            or
+            row.get("expiry")
+            or
+            row.get("expirydate")
+        )
+
+        oi = (
+            row.get("openInterest")
+            or
+            row.get("openinterest")
+            or
+            row.get("oi")
+        )
+
+        ltp = (
+            row.get("lastPrice")
+            or
+            row.get("ltp")
+            or
+            row.get("closePrice")
+        )
+
+        try:
+
+            oi = float(
+                str(oi)
+                .replace(",", "")
+            )
+
+        except Exception:
+
+            oi = None
+
+        try:
+
+            ltp = float(
+                str(ltp)
+                .replace(",", "")
+            )
+
+        except Exception:
+
+            ltp = None
+
+        if expiry:
+
+            parsed.append({
+
+                "Expiry":
+                    str(expiry),
+
+                "OI":
+                    oi,
+
+                "Price":
+                    ltp
+            })
+
+    if not parsed:
+        return None
+
+    return pd.DataFrame(
+        parsed
+    )
+
+
+# ============================================================
+# ROLLOVER SCORE
+# ============================================================
+
+def rollover_signal(
+    last_week_close,
+    last_week_open,
+    current_future,
+    next_future,
+    current_oi,
+    next_oi
+):
+
+    bullish = False
+
+    if (
+        last_week_close is not None
+        and
+        last_week_open is not None
+    ):
+
+        bullish = (
+            last_week_close >
+            last_week_open
+        )
+
+    rollover = None
+
+    if (
+        current_oi
+        and
+        next_oi
+        and
+        (
+            current_oi +
+            next_oi
+        ) > 0
+    ):
+
+        rollover = (
+            next_oi /
+            (
+                current_oi +
+                next_oi
+            )
+        ) * 100
+
+    rollover_cost = None
+
+    if (
+        current_future is not None
+        and
+        next_future is not None
+        and
+        current_future > 0
+    ):
+
+        rollover_cost = (
+            (
+                next_future -
+                current_future
+            )
+            /
+            current_future
+        ) * 100
+
+    score = 0
+
+    if bullish:
+        score += 1
+
+    if (
+        rollover is not None
+        and
+        rollover >= rollover_high_percent
+    ):
+        score += 1
+
+    if (
+        rollover_cost is not None
+        and
+        rollover_cost >=
+        rollover_cost_high_percent
+    ):
+        score += 1
+
+    if score >= 3:
+        signal = "🔥 STRONG BULLISH ROLLOVER"
+
+    elif score == 2:
+        signal = "🟢 BULLISH ROLLOVER"
+
+    elif score == 1:
+        signal = "🟡 WATCH"
+
+    else:
+        signal = "⚪ NO SIGNAL"
+
+    return (
+        bullish,
+        rollover,
+        rollover_cost,
+        signal
+    )
+
+
+# ============================================================
+# SIMPLE 1-YEAR BACKTEST
+#
+# Spot-history based:
+# Bullish weekly close + breakout filter
+#
+# This is deliberately conservative.
+# It does NOT pretend historical option bid/ask
+# was available if free source doesn't provide it.
+# ============================================================
+
+def backtest_stock(
+    df,
+    holding_days=20
+):
+
+    if df.empty or len(df) < 100:
+        return None
+
+    x = df.copy()
+
+    x["SMA20"] = (
+        x["close"]
+        .rolling(20)
+        .mean()
+    )
+
+    x["SMA50"] = (
+        x["close"]
+        .rolling(50)
+        .mean()
+    )
+
+    x["ROC20"] = (
+        x["close"]
+        .pct_change(20)
+        *
+        100
+    )
+
+    trades = []
+
+    i = 60
+
+    while i < len(x) - holding_days:
+
+        price = x["close"].iloc[i]
+
+        previous_high = (
+            x["high"]
+            .iloc[i-20:i]
+            .max()
+        )
+
+        bullish = (
+            price >
+            x["SMA20"].iloc[i]
+            and
+            x["SMA20"].iloc[i] >
+            x["SMA50"].iloc[i]
+            and
+            price >
+            previous_high * 0.98
+        )
+
+        if not bullish:
+
+            i += 1
+            continue
+
+        entry = price
+
+        exit_price = (
+            x["close"]
+            .iloc[
+                i +
+                holding_days
+            ]
+        )
+
+        ret = (
+            (
+                exit_price -
+                entry
+            )
+            /
+            entry
+        ) * 100
+
+        trades.append(ret)
+
+        i += holding_days
+
+    if not trades:
+        return {
+
+            "Trades":
+                0,
+
+            "Win Rate %":
+                0,
+
+            "Average Return %":
+                0,
+
+            "Total Return %":
+                0,
+
+            "Max Drawdown %":
+                0
+        }
+
+    wins = [
+        x for x in trades
+        if x > 0
+    ]
+
+    equity = [100.0]
+
+    for r in trades:
+
+        equity.append(
+            equity[-1] *
+            (
+                1 +
+                r / 100
+            )
+        )
+
+    eq = np.array(
+        equity
+    )
+
+    peak = np.maximum.accumulate(
+        eq
+    )
+
+    drawdown = (
+        (
+            eq -
+            peak
+        )
+        /
+        peak
+    ) * 100
+
+    return {
+
+        "Trades":
+            len(trades),
+
+        "Win Rate %":
+            round(
+                len(wins) /
+                len(trades) *
+                100,
+                2
+            ),
+
+        "Average Return %":
+            round(
+                np.mean(trades),
+                2
+            ),
+
+        "Total Return %":
+            round(
+                (
+                    equity[-1] /
+                    equity[0] -
+                    1
+                )
+                *
+                100,
+                2
+            ),
+
+        "Max Drawdown %":
+            round(
+                drawdown.min(),
+                2
+            )
+    }
+
+
+# ============================================================
+# ROLLOVER SCANNER
+# ============================================================
+
+def scan_rollover(
+    jwt,
+    master,
+    days=365
+):
+
+    expiry = current_month_expiry(
+        master,
+        "NFO"
+    )
+
+    if expiry is None:
+        return pd.DataFrame()
+
+    fmap = stock_future_map(
+        master,
+        expiry
+    )
+
+    spot_map = cash_token_map(
+        master
+    )
+
+    rows = []
+
+    stocks = sorted(
+        [
+            s
+            for s in fmap
+            if s in spot_map
+        ]
+    )
+
+    def worker(stock):
+
+        try:
+
+            future_row = fmap[
+                stock
+            ]
+
+            spot_token = (
+                spot_map[stock]["token"]
+            )
+
+            df = historical(
+                jwt,
+                spot_token,
+                "ONE_DAY",
+                days
+            )
+
+            if df.empty:
+                return None
+
+            df["datetime"] = pd.to_datetime(
+                df["datetime"],
+                errors="coerce"
+            )
+
+            df = df.dropna(
+                subset=["datetime"]
+            )
+
+            if len(df) < 100:
+                return None
+
+            last_week = df.iloc[
+                -5:
+            ]
+
+            last_week_open = float(
+                last_week["open"].iloc[0]
+            )
+
+            last_week_close = float(
+                last_week["close"].iloc[-1]
+            )
+
+            # Current future quote
+            token = str(
+                future_row["token"]
+            )
+
+            fq = batch_full_quote(
+                jwt,
+                "NFO",
+                [token]
+            ).get(
+                token,
+                {}
+            )
+
+            current_future = fq.get(
+                "ltp"
+            )
+
+            # Next expiry from master
+            next_rows = master[
+                (master["exchange"] == "NFO")
+                &
+                (master["instrument"] == "FUTSTK")
+                &
+                (master["name"] == stock)
+                &
+                (
+                    master["expiry_date"]
+                    > expiry
+                )
+            ]
+
+            next_rows = next_rows.sort_values(
+                "expiry_date"
+            )
+
+            next_future = None
+
+            next_expiry = None
+
+            if not next_rows.empty:
+
+                next_row = next_rows.iloc[0]
+
+                next_expiry = (
+                    next_row[
+                        "expiry_date"
+                    ]
+                )
+
+                next_token = str(
+                    next_row["token"]
+                )
+
+                nq = batch_full_quote(
+                    jwt,
+                    "NFO",
+                    [next_token]
+                ).get(
+                    next_token,
+                    {}
+                )
+
+                next_future = nq.get(
+                    "ltp"
+                )
+
+            # ------------------------------------------------
+            # OI from NSE where possible
+            # ------------------------------------------------
+
+            nse_data = nse_derivative_quote(
+                stock
+            )
+
+            parsed = parse_rollover_from_nse(
+                nse_data,
+                stock
+            )
+
+            current_oi = None
+            next_oi = None
+
+            if (
+                parsed is not None
+                and
+                not parsed.empty
+            ):
+
+                # Best effort:
+                # first two contracts
+                parsed = parsed.sort_values(
+                    "Expiry"
+                )
+
+                if len(parsed) >= 1:
+                    current_oi = parsed[
+                        "OI"
+                    ].iloc[0]
+
+                if len(parsed) >= 2:
+                    next_oi = parsed[
+                        "OI"
+                    ].iloc[1]
+
+            (
+                bullish,
+                rollover,
+                rollover_cost,
+                signal
+            ) = rollover_signal(
+
+                last_week_close,
+
+                last_week_open,
+
+                current_future,
+
+                next_future,
+
+                current_oi,
+
+                next_oi
+            )
+
+            bt = backtest_stock(
+                df,
+                20
+            )
+
+            if bt is None:
+                return None
+
+            return {
+
+                "Stock":
+                    stock,
+
+                "Last Week Open":
+                    round(
+                        last_week_open,
+                        2
+                    ),
+
+                "Last Week Close":
+                    round(
+                        last_week_close,
+                        2
+                    ),
+
+                "Last Week Bullish":
+                    "YES"
+                    if bullish
+                    else "NO",
+
+                "Current Future":
+                    current_future,
+
+                "Next Future":
+                    next_future,
+
+                "Rollover %":
+                    round(
+                        rollover,
+                        2
+                    )
+                    if rollover is not None
+                    else None,
+
+                "Rollover Cost %":
+                    round(
+                        rollover_cost,
+                        2
+                    )
+                    if rollover_cost is not None
+                    else None,
+
+                "High Rollover":
+                    "YES"
+                    if (
+                        rollover is not None
+                        and
+                        rollover >=
+                        rollover_high_percent
+                    )
+                    else "NO",
+
+                "High Rollover Cost":
+                    "YES"
+                    if (
+                        rollover_cost is not None
+                        and
+                        rollover_cost >=
+                        rollover_cost_high_percent
+                    )
+                    else "NO",
+
+                "Backtest Trades":
+                    bt["Trades"],
+
+                "Backtest Win Rate %":
+                    bt["Win Rate %"],
+
+                "Backtest Avg Return %":
+                    bt["Average Return %"],
+
+                "Backtest Total Return %":
+                    bt["Total Return %"],
+
+                "Backtest Max DD %":
+                    bt["Max Drawdown %"],
+
+                "Signal":
+                    signal
+            }
+
+        except Exception:
+
+            return None
+
+    with ThreadPoolExecutor(
+        max_workers=5
+    ) as executor:
+
+        futures = [
+            executor.submit(
+                worker,
+                stock
+            )
+            for stock in stocks
+        ]
+
+        for f in as_completed(
+            futures
+        ):
+
+            try:
+
+                r = f.result()
+
+                if r:
+                    rows.append(r)
+
+            except Exception:
+                pass
+
+    result = pd.DataFrame(
+        rows
+    )
+
+    if result.empty:
+        return result
+
+    signal_order = {
+
+        "🔥 STRONG BULLISH ROLLOVER": 4,
+
+        "🟢 BULLISH ROLLOVER": 3,
+
+        "🟡 WATCH": 2,
+
+        "⚪ NO SIGNAL": 1
+    }
+
+    result["_score"] = (
+        result["Signal"]
+        .map(
+            signal_order
+        )
+        .fillna(0)
+    )
+
+    result = result.sort_values(
+        [
+            "_score",
+            "Backtest Win Rate %",
+            "Rollover %"
+        ],
+        ascending=[
+            False,
+            False,
+            False
+        ]
+    ).drop(
+        columns="_score"
+    ).reset_index(
+        drop=True
+    )
+
+    result.insert(
+        0,
+        "Rank",
+        range(
+            1,
+            len(result) + 1
+        )
+    )
 
     return result
 
@@ -2393,7 +4106,7 @@ def show_result(
 
 
 # ============================================================
-# LOAD MASTER ONCE
+# LOAD MASTER
 # ============================================================
 
 try:
@@ -2413,12 +4126,10 @@ except Exception as e:
 
 
 # ============================================================
-# LOGIN BUTTON
+# JWT
 # ============================================================
 
-if (
-    "jwt" not in st.session_state
-):
+if "jwt" not in st.session_state:
 
     st.session_state[
         "jwt"
@@ -2455,7 +4166,7 @@ jwt = st.session_state.get(
 if not jwt:
 
     st.warning(
-        "पहले ऊपर Connect Angel One दबाएँ।"
+        "पहले Connect Angel One दबाएँ।"
     )
 
     st.stop()
@@ -2468,11 +4179,7 @@ if not jwt:
 st.divider()
 
 st.header(
-    "1️⃣ 📈 Nifty 50 RSI + OBV Scanner"
-)
-
-st.caption(
-    "Fall → Sideways + RSI Rising + OBV"
+    "1️⃣ 📈 Nifty 50 RSI + OBV"
 )
 
 if st.button(
@@ -2482,33 +4189,18 @@ if st.button(
     use_container_width=True
 ):
 
-    try:
+    with st.spinner(
+        "RSI scanner..."
+    ):
 
-        with st.spinner(
-            "RSI scanner..."
-        ):
-
-            result = scan_rsi(
-                jwt,
-                master
-            )
-
-        st.session_state[
-            "rsi_result"
-        ] = result
-
-        st.success(
-            f"RSI scan complete — "
-            f"{len(result)} stocks"
+        result = scan_rsi(
+            jwt,
+            master
         )
 
-    except Exception as e:
-
-        st.error(
-            "RSI Error: "
-            + str(e)
-        )
-
+    st.session_state[
+        "rsi_result"
+    ] = result
 
 show_result(
     st.session_state.get(
@@ -2520,235 +4212,268 @@ show_result(
 
 
 # ============================================================
-# 2 FUTURE SPOT
+# 2 FUTURE > SPOT
 # ============================================================
 
 st.divider()
 
 st.header(
-    "2️⃣ ⚡ Future > Spot Scanner"
+    "2️⃣ ⚡ Future > Spot + MTF Cost + Net Profit"
+)
+
+st.caption(
+    "Spot खरीदना + MTF funding + Future sell "
+    "→ expiry तक interest + brokerage + statutory charges"
 )
 
 if st.button(
-    "🔄 Scan Future > Spot",
+    "🚀 Scan Future > Spot + COMPLETE COST",
     key="future_button",
     type="primary",
     use_container_width=True
 ):
 
-    try:
+    start = time.time()
 
-        with st.spinner(
-            "Future + Spot..."
-        ):
+    with st.spinner(
+        "Future > Spot cost calculation..."
+    ):
 
-            result = scan_future_spot(
-                jwt,
-                master
-            )
-
-        st.session_state[
-            "future_result"
-        ] = result
-
-        st.success(
-            f"Future-Spot scan complete — "
-            f"{len(result)} stocks"
+        result = scan_future_spot(
+            jwt,
+            master,
+            mtf_own_percent,
+            mtf_interest_daily
         )
 
-    except Exception as e:
+    elapsed = (
+        time.time() -
+        start
+    )
 
-        st.error(
-            "Future Error: "
-            + str(e)
-        )
+    st.session_state[
+        "future_result"
+    ] = result
 
+    st.success(
+        f"Complete — "
+        f"{len(result)} setups | "
+        f"{elapsed:.1f} sec"
+    )
 
 show_result(
     st.session_state.get(
         "future_result",
         pd.DataFrame()
     ),
-    "future_spot_scanner.csv"
+    "future_spot_complete_cost.csv"
 )
 
 
 # ============================================================
-# 3 ALL F&O STOCK PARITY
+# 3 STOCK PARITY PART 1
 # ============================================================
 
 st.divider()
 
 st.header(
-    "3️⃣ ⚖️ ALL F&O Stock Put-Call Parity"
-)
-
-st.caption(
-    "सभी current-month F&O stocks | "
-    "Bid/Ask based executable edge | दोनों direction"
+    "3️⃣ ⚖️ Stock Put-Call Parity — PART 1"
 )
 
 if st.button(
-    "🚀 Scan ALL F&O Stock Parity",
-    key="all_stock_parity_button",
+    "🚀 Run Stock Parity PART 1",
+    key="parity_part1",
     type="primary",
     use_container_width=True
 ):
 
-    try:
+    with st.spinner(
+        "Stock parity Part 1..."
+    ):
 
-        start = time.time()
-
-        with st.spinner(
-            "सभी F&O stocks की parity scan हो रही है..."
-        ):
-
-            result = scan_all_stock_parity(
-                jwt,
-                master,
-                parity_strikes,
-                parity_threshold
-            )
-
-        elapsed = (
-            time.time() - start
+        result = scan_stock_parity_part(
+            jwt,
+            master,
+            parity_strikes,
+            parity_threshold,
+            1
         )
 
-        st.session_state[
-            "all_stock_parity_result"
-        ] = result
-
-        st.success(
-            f"F&O parity complete — "
-            f"{len(result)} setups | "
-            f"{elapsed:.1f} sec"
-        )
-
-    except Exception as e:
-
-        st.error(
-            "F&O Parity Error: "
-            + str(e)
-        )
-
+    st.session_state[
+        "parity_part1_result"
+    ] = result
 
 show_result(
     st.session_state.get(
-        "all_stock_parity_result",
+        "parity_part1_result",
         pd.DataFrame()
     ),
-    "all_fno_stock_parity.csv"
+    "stock_parity_part1.csv"
 )
 
 
 # ============================================================
-# 4 NIFTY 50 INDEX
+# 4 STOCK PARITY PART 2
 # ============================================================
 
 st.divider()
 
 st.header(
-    "4️⃣ 📊 Nifty 50 Index Put-Call Parity"
+    "4️⃣ ⚖️ Stock Put-Call Parity — PART 2"
 )
 
 if st.button(
-    "🔄 Scan Nifty 50 Index",
-    key="nifty_index_button",
+    "🚀 Run Stock Parity PART 2",
+    key="parity_part2",
     type="primary",
     use_container_width=True
 ):
 
-    try:
+    with st.spinner(
+        "Stock parity Part 2..."
+    ):
 
-        with st.spinner(
-            "Nifty Index parity..."
-        ):
-
-            result = scan_index_parity(
-                jwt,
-                master,
-                "NIFTY",
-                parity_strikes,
-                parity_threshold
-            )
-
-        st.session_state[
-            "nifty_index_result"
-        ] = result
-
-        st.success(
-            f"Nifty Index scan complete — "
-            f"{len(result)} setups"
+        result = scan_stock_parity_part(
+            jwt,
+            master,
+            parity_strikes,
+            parity_threshold,
+            2
         )
 
-    except Exception as e:
-
-        st.error(
-            "Nifty Error: "
-            + str(e)
-        )
-
+    st.session_state[
+        "parity_part2_result"
+    ] = result
 
 show_result(
     st.session_state.get(
-        "nifty_index_result",
+        "parity_part2_result",
         pd.DataFrame()
     ),
-    "nifty_index_parity.csv"
+    "stock_parity_part2.csv"
 )
 
 
 # ============================================================
-# 5 BANKNIFTY
+# 5 STOCK PARITY PART 3
 # ============================================================
 
 st.divider()
 
 st.header(
-    "5️⃣ 🏦 BankNifty Put-Call Parity"
+    "5️⃣ ⚖️ Stock Put-Call Parity — PART 3"
 )
 
 if st.button(
-    "🔄 Scan BankNifty",
-    key="banknifty_button",
+    "🚀 Run Stock Parity PART 3",
+    key="parity_part3",
     type="primary",
     use_container_width=True
 ):
 
-    try:
+    with st.spinner(
+        "Stock parity Part 3..."
+    ):
 
-        with st.spinner(
-            "BankNifty parity..."
-        ):
-
-            result = scan_index_parity(
-                jwt,
-                master,
-                "BANKNIFTY",
-                parity_strikes,
-                parity_threshold
-            )
-
-        st.session_state[
-            "banknifty_result"
-        ] = result
-
-        st.success(
-            f"BankNifty scan complete — "
-            f"{len(result)} setups"
+        result = scan_stock_parity_part(
+            jwt,
+            master,
+            parity_strikes,
+            parity_threshold,
+            3
         )
 
-    except Exception as e:
-
-        st.error(
-            "BankNifty Error: "
-            + str(e)
-        )
-
+    st.session_state[
+        "parity_part3_result"
+    ] = result
 
 show_result(
     st.session_state.get(
-        "banknifty_result",
+        "parity_part3_result",
+        pd.DataFrame()
+    ),
+    "stock_parity_part3.csv"
+)
+
+
+# ============================================================
+# 6 NIFTY
+# ============================================================
+
+st.divider()
+
+st.header(
+    "6️⃣ 📊 NIFTY Put-Call Parity"
+)
+
+if st.button(
+    "🚀 Scan NIFTY",
+    key="nifty_button",
+    type="primary",
+    use_container_width=True
+):
+
+    with st.spinner(
+        "NIFTY parity..."
+    ):
+
+        result = scan_index_parity(
+            jwt,
+            master,
+            "NIFTY",
+            parity_strikes,
+            parity_threshold
+        )
+
+    st.session_state[
+        "nifty_result"
+    ] = result
+
+show_result(
+    st.session_state.get(
+        "nifty_result",
+        pd.DataFrame()
+    ),
+    "nifty_parity.csv"
+)
+
+
+# ============================================================
+# 7 BANKNIFTY
+# ============================================================
+
+st.divider()
+
+st.header(
+    "7️⃣ 🏦 BANKNIFTY Put-Call Parity"
+)
+
+if st.button(
+    "🚀 Scan BANKNIFTY",
+    key="bank_button",
+    type="primary",
+    use_container_width=True
+):
+
+    with st.spinner(
+        "BANKNIFTY parity..."
+    ):
+
+        result = scan_index_parity(
+            jwt,
+            master,
+            "BANKNIFTY",
+            parity_strikes,
+            parity_threshold
+        )
+
+    st.session_state[
+        "bank_result"
+    ] = result
+
+show_result(
+    st.session_state.get(
+        "bank_result",
         pd.DataFrame()
     ),
     "banknifty_parity.csv"
@@ -2756,52 +4481,37 @@ show_result(
 
 
 # ============================================================
-# 6 SENSEX
+# 8 SENSEX
 # ============================================================
 
 st.divider()
 
 st.header(
-    "6️⃣ 📊 Sensex Put-Call Parity"
+    "8️⃣ 📊 SENSEX Put-Call Parity"
 )
 
 if st.button(
-    "🔄 Scan Sensex",
+    "🚀 Scan SENSEX",
     key="sensex_button",
     type="primary",
     use_container_width=True
 ):
 
-    try:
+    with st.spinner(
+        "SENSEX parity..."
+    ):
 
-        with st.spinner(
-            "Sensex parity..."
-        ):
-
-            result = scan_index_parity(
-                jwt,
-                master,
-                "SENSEX",
-                parity_strikes,
-                parity_threshold
-            )
-
-        st.session_state[
-            "sensex_result"
-        ] = result
-
-        st.success(
-            f"Sensex scan complete — "
-            f"{len(result)} setups"
+        result = scan_index_parity(
+            jwt,
+            master,
+            "SENSEX",
+            parity_strikes,
+            parity_threshold
         )
 
-    except Exception as e:
-
-        st.error(
-            "Sensex Error: "
-            + str(e)
-        )
-
+    st.session_state[
+        "sensex_result"
+    ] = result
 
 show_result(
     st.session_state.get(
@@ -2813,28 +4523,116 @@ show_result(
 
 
 # ============================================================
-# LAST UPDATE
+# 9 ROLLOVER
 # ============================================================
 
 st.divider()
 
-st.caption(
-    "📡 Data source: Angel One SmartAPI"
+st.header(
+    "9️⃣ 🔁 Bullish + High Rollover + High Rollover Cost"
 )
 
 st.caption(
-    "⚡ Parity में LTP के साथ Bid/Ask executable edge "
-    "को प्राथमिकता दी गई है।"
+    "Free NSE data + Angel historical spot data | "
+    "लगभग 1-year backtest"
+)
+
+if st.button(
+    "🚀 Scan Rollover + 1Y Backtest",
+    key="rollover_button",
+    type="primary",
+    use_container_width=True
+):
+
+    start = time.time()
+
+    with st.spinner(
+        "Rollover + backtest scan..."
+    ):
+
+        result = scan_rollover(
+            jwt,
+            master,
+            int(backtest_days)
+        )
+
+    elapsed = (
+        time.time() -
+        start
+    )
+
+    st.session_state[
+        "rollover_result"
+    ] = result
+
+    st.success(
+        f"Rollover scan complete — "
+        f"{len(result)} stocks | "
+        f"{elapsed:.1f} sec"
+    )
+
+show_result(
+    st.session_state.get(
+        "rollover_result",
+        pd.DataFrame()
+    ),
+    "rollover_1year_backtest.csv"
+)
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+st.divider()
+
+st.header(
+    "📌 Calculation Notes"
+)
+
+st.info(
+    """
+    • Future > Spot में Spot stock को MTF से खरीदने की अनुमानित
+      funding calculation की गई है।
+
+    • Default MTF: 25% आपका पैसा + 75% broker funding.
+
+    • MTF interest default 0.049%/day है; sidebar में बदल सकते हैं।
+
+    • Interest expiry तक remaining days पर calculate किया जाता है।
+
+    • Future sell में brokerage + STT + transaction + SEBI +
+      stamp + GST estimate शामिल है।
+
+    • Put-Call Parity में Bid/Ask executable price को LTP से
+      प्राथमिकता दी गई है।
+
+    • Stock parity को तीन independent parts में बाँटा गया है,
+      इसलिए Part 1/2/3 अलग-अलग run किए जा सकते हैं।
+
+    • NIFTY और BANKNIFTY अलग independent scanners हैं।
+
+    • Rollover scanner के लिए NSE free/public derivative data
+      जहाँ उपलब्ध है वहाँ इस्तेमाल किया जाता है।
+
+    • 1-year backtest spot-price based confirmation है।
+      Historical option bid/ask उपलब्ध न होने पर backtest को
+      actual historical executable parity backtest नहीं माना जाए।
+
+    • Future/Parity margin केवल estimated margin है।
+      Actual Angel RMS/SPAN margin market conditions के अनुसार
+      बदल सकता है।
+    """
 )
 
 st.caption(
-    "⚠️ Estimated Margin केवल rough estimate है; "
-    "actual Angel RMS margin अलग हो सकता है।"
+    "📡 Live quotes: Angel One SmartAPI | "
+    "Historical/Rollover supplement: NSE public data"
 )
 
 st.caption(
-    "💾 हर scanner का result अगले successful scan तक "
-    "session में सुरक्षित रहता है।"
+    "⚠️ Final execution से पहले Angel One के actual "
+    "Trades & Charges / RMS margin को verify करें।"
 )
 
 
@@ -2846,11 +4644,11 @@ if auto_refresh:
 
     st.info(
         f"🔄 Auto Refresh ON — "
-        f"हर {refresh_seconds} सेकंड में page refresh होगा।"
+        f"हर {refresh_seconds} सेकंड में refresh होगा।"
     )
 
     time.sleep(
-        refresh_seconds
+        int(refresh_seconds)
     )
 
     st.rerun()
