@@ -1,68 +1,56 @@
-import streamlit as st
+code = r'''import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
 import pyotp
-import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-
 # ============================================================
-# PAGE CONFIG
+# FAST MARKET SCANNER PRO - FRESH SAFE VERSION
 # ============================================================
 
 st.set_page_config(
-    page_title="Market Scanner PRO",
+    page_title="Fast Market Scanner PRO",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
-st.title("📊 Fast Market Scanner PRO")
-
 IST = ZoneInfo("Asia/Kolkata")
-
 BASE_URL = "https://apiconnect.angelone.in"
 
-# ============================================================
-# SETTINGS
-# ============================================================
+# ------------------------- SETTINGS -------------------------
 
 with st.sidebar:
-
     st.header("⚙️ Scanner Settings")
-
-    st.subheader("Parity")
 
     parity_threshold = st.number_input(
         "Minimum Executable Edge ₹",
         min_value=0.0,
         value=5.0,
-        step=0.5
+        step=0.5,
     )
 
-    parity_strikes = st.number_input(
+    strike_count = st.number_input(
         "Liquid Strikes Around Future",
         min_value=3,
         max_value=30,
         value=10,
-        step=1
+        step=1,
     )
-
-    st.subheader("Liquidity")
 
     min_option_volume = st.number_input(
         "Minimum Option Volume",
         min_value=0,
         value=1000,
-        step=100
+        step=100,
     )
 
     min_option_oi = st.number_input(
         "Minimum Option OI",
         min_value=0,
         value=10000,
-        step=1000
+        step=1000,
     )
 
     max_spread_percent = st.number_input(
@@ -70,91 +58,25 @@ with st.sidebar:
         min_value=0.1,
         max_value=20.0,
         value=3.0,
-        step=0.5
+        step=0.5,
     )
-
-    st.subheader("Margin")
-
-    margin_percent = st.number_input(
-        "Estimated Future Margin %",
-        min_value=5.0,
-        max_value=50.0,
-        value=15.0,
-        step=1.0
-    )
-
-    st.subheader("Scanner")
 
     stock_parts = st.number_input(
-        "Stock Scanner Parts",
+        "Stock Parity Parts",
         min_value=1,
-        max_value=10,
+        max_value=5,
         value=5,
-        step=1
+        step=1,
     )
 
-    st.caption(
-        "Liquid strike criteria हमेशा ON रहेगा."
-    )
+# ------------------------- SECRETS -------------------------
 
+API_KEY = st.secrets.get("ANGEL_API_KEY", "")
+CLIENT_ID = st.secrets.get("ANGEL_CLIENT_CODE", "")
+PASSWORD = st.secrets.get("ANGEL_PASSWORD", "")
+TOTP_SECRET = st.secrets.get("ANGEL_TOTP_SECRET", "")
 
-# ============================================================
-# SECRETS
-# ============================================================
-
-API_KEY = st.secrets.get(
-    "ANGEL_API_KEY",
-    ""
-)
-
-CLIENT_ID = st.secrets.get(
-    "ANGEL_CLIENT_CODE",
-    ""
-)
-
-PASSWORD = st.secrets.get(
-    "ANGEL_PASSWORD",
-    ""
-)
-
-TOTP_SECRET = st.secrets.get(
-    "ANGEL_TOTP_SECRET",
-    ""
-)
-
-
-# ============================================================
-# VALIDATE SECRETS
-# ============================================================
-
-missing = []
-
-if not API_KEY:
-    missing.append("ANGEL_API_KEY")
-
-if not CLIENT_ID:
-    missing.append("ANGEL_CLIENT_CODE")
-
-if not PASSWORD:
-    missing.append("ANGEL_PASSWORD")
-
-if not TOTP_SECRET:
-    missing.append("ANGEL_TOTP_SECRET")
-
-
-if missing:
-
-    st.error(
-        "Streamlit Secrets में ये values missing हैं: "
-        + ", ".join(missing)
-    )
-
-    st.stop()
-
-
-# ============================================================
-# ANGEL HEADERS
-# ============================================================
+# ------------------------- HEADERS -------------------------
 
 BASE_HEADERS = {
     "Content-Type": "application/json",
@@ -164,109 +86,68 @@ BASE_HEADERS = {
     "X-PrivateKey": API_KEY,
     "X-ClientLocalIP": "127.0.0.1",
     "X-ClientPublicIP": "127.0.0.1",
-    "X-MACAddress": "00:00:00:00:00:00"
+    "X-MACAddress": "00:00:00:00:00:00",
 }
 
 
 def auth_headers(jwt):
-
-    headers = BASE_HEADERS.copy()
-
-    headers["Authorization"] = (
-        "Bearer " + jwt
-    )
-
-    return headers
+    h = BASE_HEADERS.copy()
+    h["Authorization"] = "Bearer " + jwt
+    return h
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def safe_float(value):
-
+def safe_float(x):
     try:
-
-        if value is None:
+        if x is None or x == "":
             return None
-
-        return float(value)
-
+        return float(x)
     except Exception:
-
         return None
 
 
 def now_ist():
-
     return datetime.now(IST)
-
-
-def clean_symbol(value):
-
-    return (
-        str(value)
-        .upper()
-        .strip()
-    )
 
 
 # ============================================================
 # LOGIN
 # ============================================================
 
-@st.cache_resource(ttl=120)
-def angel_login():
+def login():
+    if not all([API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET]):
+        raise RuntimeError(
+            "Angel One Secrets missing. Required: "
+            "ANGEL_API_KEY, ANGEL_CLIENT_CODE, "
+            "ANGEL_PASSWORD, ANGEL_TOTP_SECRET"
+        )
 
-    totp = pyotp.TOTP(
-        TOTP_SECRET
-    ).now()
-
-    url = (
-        BASE_URL
-        + "/rest/auth/angelbroking/"
-        + "user/v1/loginByPassword"
-    )
+    url = BASE_URL + "/rest/auth/angelbroking/user/v1/loginByPassword"
 
     payload = {
         "clientcode": CLIENT_ID,
         "password": PASSWORD,
-        "totp": totp
+        "totp": pyotp.TOTP(TOTP_SECRET).now(),
     }
 
-    response = requests.post(
+    r = requests.post(
         url,
         json=payload,
         headers=BASE_HEADERS,
-        timeout=20
+        timeout=20,
     )
+    r.raise_for_status()
 
-    response.raise_for_status()
-
-    data = response.json()
+    data = r.json()
 
     if data.get("status") is not True:
-
-        raise Exception(
-            "Angel Login Failed: "
-            + str(
-                data.get(
-                    "message",
-                    "Unknown error"
-                )
-            )
+        raise RuntimeError(
+            "Angel Login Failed: " +
+            str(data.get("message", "Unknown error"))
         )
 
-    token = (
-        data.get("data", {})
-        .get("jwtToken")
-    )
-
+    token = data.get("data", {}).get("jwtToken")
     if not token:
-
-        raise Exception(
-            "JWT token नहीं मिला."
-        )
+        raise RuntimeError("JWT token नहीं मिला।")
 
     return token
 
@@ -275,116 +156,53 @@ def angel_login():
 # MASTER
 # ============================================================
 
-@st.cache_data(
-    ttl=1800,
-    show_spinner=False
-)
+@st.cache_data(ttl=1800, show_spinner=False)
 def download_master():
-
     url = (
         "https://margincalculator.angelbroking.com/"
         "OpenAPI_File/files/OpenAPIScripMaster.json"
     )
 
-    response = requests.get(
-        url,
-        timeout=60
-    )
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
 
-    response.raise_for_status()
-
-    data = response.json()
+    data = r.json()
 
     if not data:
-
-        raise Exception(
-            "Angel master खाली मिला."
-        )
+        raise RuntimeError("Angel master खाली मिला।")
 
     return pd.DataFrame(data)
 
 
-@st.cache_data(
-    ttl=1800,
-    show_spinner=False
-)
+@st.cache_data(ttl=1800, show_spinner=False)
 def prepare_master(master):
-
     df = master.copy()
 
-    required = [
-        "token",
-        "symbol",
-        "name",
-        "exch_seg",
-        "instrumenttype",
-        "expiry",
-        "strike",
-        "lotsize"
-    ]
+    for col in ["token", "symbol", "name", "exch_seg", "instrumenttype"]:
+        if col not in df.columns:
+            df[col] = ""
 
-    missing = [
-        x for x in required
-        if x not in df.columns
-    ]
-
-    if missing:
-
-        raise Exception(
-            "Master columns missing: "
-            + ", ".join(missing)
-        )
-
-    df["token"] = (
-        df["token"]
-        .astype(str)
-        .str.strip()
-    )
-
-    df["symbol"] = (
-        df["symbol"]
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
-
-    df["name"] = (
-        df["name"]
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
-
-    df["exchange"] = (
-        df["exch_seg"]
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
-
+    df["token"] = df["token"].astype(str).str.strip()
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+    df["name"] = df["name"].astype(str).str.upper().str.strip()
+    df["exchange"] = df["exch_seg"].astype(str).str.upper().str.strip()
     df["instrument"] = (
-        df["instrumenttype"]
-        .astype(str)
-        .str.upper()
-        .str.strip()
+        df["instrumenttype"].astype(str).str.upper().str.strip()
     )
 
     df["expiry_date"] = pd.to_datetime(
-        df["expiry"],
+        df.get("expiry", ""),
         errors="coerce",
-        dayfirst=True
+        dayfirst=True,
     )
 
     df["strike_num"] = (
-        pd.to_numeric(
-            df["strike"],
-            errors="coerce"
-        ) / 100
+        pd.to_numeric(df.get("strike", np.nan), errors="coerce") / 100
     )
 
     df["lot_size"] = pd.to_numeric(
-        df["lotsize"],
-        errors="coerce"
+        df.get("lotsize", np.nan),
+        errors="coerce",
     )
 
     return df
@@ -394,363 +212,189 @@ def prepare_master(master):
 # QUOTE
 # ============================================================
 
-def batch_full_quote(
-    jwt,
-    exchange,
-    tokens
-):
-
+def batch_full_quote(jwt, exchange, tokens):
     tokens = list(
         dict.fromkeys(
-            str(x)
-            for x in tokens
-            if x is not None
-            and str(x).strip()
+            str(x) for x in tokens
+            if str(x).strip()
         )
     )
 
     if not tokens:
-
         return {}
 
-    url = (
-        BASE_URL
-        + "/rest/secure/angelbroking/"
-        + "market/v1/quote/"
-    )
-
+    url = BASE_URL + "/rest/secure/angelbroking/market/v1/quote/"
     result = {}
 
-    # Angel supports max 50 tokens per request
-    for start in range(
-        0,
-        len(tokens),
-        50
-    ):
-
-        batch = tokens[
-            start:start + 50
-        ]
+    for i in range(0, len(tokens), 50):
+        batch = tokens[i:i + 50]
 
         payload = {
             "mode": "FULL",
             "exchangeTokens": {
                 exchange: batch
-            }
+            },
         }
 
         try:
-
-            response = requests.post(
+            r = requests.post(
                 url,
                 json=payload,
                 headers=auth_headers(jwt),
-                timeout=20
+                timeout=20,
             )
-
-            if response.status_code != 200:
-                continue
-
-            data = response.json()
+            data = r.json()
 
             if data.get("status") is not True:
                 continue
 
-            fetched = (
-                data.get("data", {})
-                .get("fetched", [])
-            )
+            fetched = data.get("data", {}).get("fetched", []) or []
 
             for item in fetched:
-
-                token = str(
-                    item.get(
-                        "symbolToken",
-                        ""
-                    )
-                )
-
+                token = str(item.get("symbolToken", "")).strip()
                 if not token:
                     continue
 
-                ltp = safe_float(
-                    item.get("ltp")
-                )
+                depth = item.get("depth") or {}
+                buys = depth.get("buy") or []
+                sells = depth.get("sell") or []
 
-                depth = item.get(
-                    "depth",
-                    {}
-                ) or {}
+                bid = buys[0].get("price") if buys else None
+                ask = sells[0].get("price") if sells else None
 
-                buys = (
-                    depth.get(
-                        "buy",
-                        []
-                    )
-                    or []
-                )
-
-                sells = (
-                    depth.get(
-                        "sell",
-                        []
-                    )
-                    or []
-                )
-
-                bid = None
-                ask = None
-
-                if buys:
-
-                    bid = safe_float(
-                        buys[0].get(
-                            "price"
-                        )
-                    )
-
-                if sells:
-
-                    ask = safe_float(
-                        sells[0].get(
-                            "price"
-                        )
-                    )
-
-                # Fallback
                 if bid is None:
-
-                    bid = safe_float(
-                        item.get(
-                            "bestBid"
-                        )
-                    )
-
+                    bid = item.get("bestBid")
                 if ask is None:
+                    ask = item.get("bestAsk")
 
-                    ask = safe_float(
-                        item.get(
-                            "bestAsk"
-                        )
-                    )
-
-                volume = safe_float(
-                    item.get(
-                        "tradeVolume"
-                    )
-                )
-
+                volume = item.get("tradeVolume")
                 if volume is None:
+                    volume = item.get("volume")
 
-                    volume = safe_float(
-                        item.get(
-                            "volume"
-                        )
-                    )
-
-                oi = safe_float(
-                    item.get(
-                        "opnInterest"
-                    )
-                )
-
+                oi = item.get("opnInterest")
                 if oi is None:
-
-                    oi = safe_float(
-                        item.get(
-                            "openInterest"
-                        )
-                    )
+                    oi = item.get("openInterest")
 
                 result[token] = {
-
-                    "ltp": ltp,
-                    "bid": bid,
-                    "ask": ask,
-                    "volume": volume,
-                    "oi": oi
+                    "ltp": safe_float(item.get("ltp")),
+                    "bid": safe_float(bid),
+                    "ask": safe_float(ask),
+                    "volume": safe_float(volume),
+                    "oi": safe_float(oi),
                 }
 
         except Exception:
-
             continue
 
     return result
 
 
-# ============================================================
-# LIQUIDITY
-# ============================================================
+def quote_is_liquid(q):
+    bid = q.get("bid")
+    ask = q.get("ask")
+    ltp = q.get("ltp")
+    volume = q.get("volume")
+    oi = q.get("oi")
 
-def quote_is_liquid(
-    quote,
-    min_volume,
-    min_oi,
-    max_spread
-):
-
-    if not quote:
+    if bid is None or ask is None or ltp is None:
         return False
 
-    bid = quote.get("bid")
-    ask = quote.get("ask")
-    ltp = quote.get("ltp")
-    volume = quote.get("volume")
-    oi = quote.get("oi")
-
-    # Bid/Ask compulsory
-    if bid is None or ask is None:
+    if bid <= 0 or ask <= 0 or ltp <= 0 or ask < bid:
         return False
 
-    # LTP compulsory
-    if ltp is None:
+    if volume is None or volume < min_option_volume:
         return False
 
-    if bid <= 0 or ask <= 0:
+    if oi is None or oi < min_option_oi:
         return False
 
-    if ask < bid:
-        return False
+    spread = ((ask - bid) / ltp) * 100
 
-    if ltp <= 0:
-        return False
-
-    # Volume filter
-    if (
-        volume is not None
-        and volume < min_volume
-    ):
-        return False
-
-    # OI filter
-    if (
-        oi is not None
-        and oi < min_oi
-    ):
-        return False
-
-    # Spread filter
-    spread = (
-        (ask - bid)
-        / ltp
-        * 100
-    )
-
-    if spread > max_spread:
-        return False
-
-    return True
+    return spread <= max_spread_percent
 
 
-def spread_percent(quote):
+def spread_pct(q):
+    bid = q.get("bid")
+    ask = q.get("ask")
+    ltp = q.get("ltp")
 
-    bid = quote.get("bid")
-    ask = quote.get("ask")
-    ltp = quote.get("ltp")
-
-    if (
-        bid is None
-        or ask is None
-        or ltp is None
-        or ltp <= 0
-    ):
-
+    if not bid or not ask or not ltp:
         return None
 
-    return (
-        (ask - bid)
-        / ltp
-        * 100
-    )
+    return ((ask - bid) / ltp) * 100
 
 
 # ============================================================
 # EXPIRIES
 # ============================================================
 
-def get_future_expiries(
-    master,
-    stock
-):
-
-    today = pd.Timestamp(
-        now_ist().date()
-    )
+def get_expiries(master, exchange="NFO"):
+    today = pd.Timestamp(now_ist().date())
 
     x = master[
-        (master["exchange"] == "NFO")
-        &
-        (master["instrument"] == "FUTSTK")
-        &
-        (master["name"] == stock)
-        &
-        master["expiry_date"].notna()
-        &
-        (
-            master["expiry_date"]
-            >= today
-        )
-    ]
+        (master["exchange"] == exchange)
+        & master["expiry_date"].notna()
+        & (master["expiry_date"] >= today)
+    ].copy()
 
-    expiries = sorted(
-        x["expiry_date"]
-        .unique()
-    )
+    if x.empty:
+        return []
 
-    return expiries[:2]
+    return sorted(x["expiry_date"].drop_duplicates().tolist())
 
 
-def get_index_expiries(
-    master,
-    index_name
-):
+def current_next_expiry(master):
+    exps = get_expiries(master, "NFO")
+    if not exps:
+        return None, None
 
-    today = pd.Timestamp(
-        now_ist().date()
-    )
+    current = exps[0]
+    next_expiry = exps[1] if len(exps) > 1 else None
 
-    x = master[
-        (master["exchange"] == "NFO")
-        &
-        (master["name"] == index_name)
-        &
-        master["expiry_date"].notna()
-        &
-        (
-            master["expiry_date"]
-            >= today
-        )
-    ]
-
-    expiries = sorted(
-        x["expiry_date"]
-        .unique()
-    )
-
-    return expiries[:2]
+    return current, next_expiry
 
 
 # ============================================================
-# STOCK FUTURES
+# FUTURE MAP
 # ============================================================
 
-def get_stock_future(
-    master,
-    stock,
-    expiry
-):
+def future_map(master, expiry):
+    if expiry is None:
+        return {}
 
     x = master[
         (master["exchange"] == "NFO")
-        &
-        (master["instrument"] == "FUTSTK")
-        &
-        (master["name"] == stock)
-        &
-        (
-            master["expiry_date"]
-            == expiry
-        )
+        & (master["instrument"] == "FUTSTK")
+        & (master["expiry_date"] == expiry)
+    ]
+
+    result = {}
+
+    for _, row in x.iterrows():
+        stock = str(row["name"]).strip()
+
+        if not stock or stock in result:
+            continue
+
+        try:
+            lot = int(row["lot_size"])
+        except Exception:
+            continue
+
+        if lot <= 0:
+            continue
+
+        result[stock] = row
+
+    return result
+
+
+def index_future(master, index_name, expiry):
+    x = master[
+        (master["exchange"] == "NFO")
+        & (master["instrument"] == "FUTIDX")
+        & (master["name"] == index_name)
+        & (master["expiry_date"] == expiry)
     ]
 
     if x.empty:
@@ -760,2136 +404,719 @@ def get_stock_future(
 
 
 # ============================================================
-# CASH MAP
+# FUTURE > SPOT
 # ============================================================
 
-@st.cache_data(
-    ttl=1800,
-    show_spinner=False
-)
-def create_cash_map(master):
-
+def cash_map(master):
     x = master[
         (master["exchange"] == "NSE")
-        &
-        master["symbol"].str.endswith(
-            "-EQ"
-        )
+        & master["symbol"].str.endswith("-EQ")
     ]
 
     result = {}
 
     for _, row in x.iterrows():
-
-        stock = (
-            str(row["symbol"])
-            .replace(
-                "-EQ",
-                ""
-            )
-            .strip()
-            .upper()
-        )
-
-        if stock:
-
-            result[stock] = {
-                "token":
-                    str(row["token"]),
-
-                "symbol":
-                    str(row["symbol"])
-            }
+        stock = row["symbol"].replace("-EQ", "").strip()
+        result[stock] = {
+            "token": str(row["token"]),
+            "symbol": row["symbol"],
+        }
 
     return result
 
 
-# ============================================================
-# FUTURE > SPOT CALCULATION
-# ============================================================
+def calculate_future_spot(master, jwt, expiry, label):
+    fmap = future_map(master, expiry)
+    cmap = cash_map(master)
 
-def calculate_future_spot(
-    spot,
-    future,
-    lot
-):
+    stocks = sorted(set(fmap) & set(cmap))
 
-    spot_value = (
-        spot * lot
-    )
+    if not stocks:
+        return pd.DataFrame()
 
-    future_value = (
-        future * lot
-    )
+    spot_tokens = [cmap[s]["token"] for s in stocks]
+    future_tokens = [str(fmap[s]["token"]) for s in stocks]
 
-    difference = (
-        future - spot
-    )
+    spot_quotes = batch_full_quote(jwt, "NSE", spot_tokens)
+    future_quotes = batch_full_quote(jwt, "NFO", future_tokens)
 
-    gross_profit = (
-        difference * lot
-    )
-
-    estimated_margin = (
-        future_value
-        * margin_percent
-        / 100
-    )
-
-    roi = (
-        gross_profit
-        / estimated_margin
-        * 100
-        if estimated_margin > 0
-        else 0
-    )
-
-    return {
-
-        "Difference":
-            difference,
-
-        "Gross Profit":
-            gross_profit,
-
-        "Spot Value":
-            spot_value,
-
-        "Future Value":
-            future_value,
-
-        "Estimated Margin":
-            estimated_margin,
-
-        "ROI %":
-            roi
-    }
-
-
-# ============================================================
-# FUTURE > SPOT SCANNER
-# ============================================================
-
-def scan_future_spot(
-    jwt,
-    master
-):
-
-    cash_map = create_cash_map(
-        master
-    )
-
-    stocks = sorted(
-        cash_map.keys()
-    )
-
-    future_rows = []
-
-    token_map = {}
+    rows = []
 
     for stock in stocks:
+        sq = spot_quotes.get(cmap[stock]["token"], {})
+        fq = future_quotes.get(str(fmap[stock]["token"]), {})
 
-        expiries = get_future_expiries(
-            master,
-            stock
-        )
-
-        if len(expiries) < 2:
-            continue
-
-        for month_no, expiry in enumerate(
-            expiries[:2],
-            start=1
-        ):
-
-            row = get_stock_future(
-                master,
-                stock,
-                expiry
-            )
-
-            if row is None:
-                continue
-
-            token_map[
-                (
-                    stock,
-                    month_no
-                )
-            ] = {
-
-                "cash_token":
-                    cash_map[stock]["token"],
-
-                "future_token":
-                    str(row["token"]),
-
-                "expiry":
-                    expiry,
-
-                "lot":
-                    int(row["lot_size"])
-            }
-
-    cash_tokens = [
-        x["cash_token"]
-        for x in token_map.values()
-    ]
-
-    future_tokens = [
-        x["future_token"]
-        for x in token_map.values()
-    ]
-
-    cash_quotes = batch_full_quote(
-        jwt,
-        "NSE",
-        cash_tokens
-    )
-
-    future_quotes = batch_full_quote(
-        jwt,
-        "NFO",
-        future_tokens
-    )
-
-    for (
-        stock,
-        month_no
-    ), info in token_map.items():
-
-        spot_quote = cash_quotes.get(
-            info["cash_token"],
-            {}
-        )
-
-        future_quote = future_quotes.get(
-            info["future_token"],
-            {}
-        )
-
-        spot = spot_quote.get(
-            "ltp"
-        )
-
-        future = future_quote.get(
-            "ltp"
-        )
+        spot = sq.get("ltp")
+        future = fq.get("ltp")
 
         if spot is None or future is None:
             continue
 
-        # User specifically wants Future > Spot
-        if future <= spot:
+        try:
+            lot = int(fmap[stock]["lot_size"])
+        except Exception:
             continue
 
-        lot = info["lot"]
+        if lot <= 0:
+            continue
 
-        calc = calculate_future_spot(
-            spot,
-            future,
-            lot
-        )
+        diff = future - spot
+        gross = diff * lot
 
-        future_rows.append({
+        if diff <= 0:
+            continue
 
-            "Month":
-                (
-                    "Current Month"
-                    if month_no == 1
-                    else
-                    "Next Month"
-                ),
-
-            "Stock":
-                stock,
-
-            "Expiry":
-                pd.Timestamp(
-                    info["expiry"]
-                ).strftime(
-                    "%d-%b-%Y"
-                ),
-
-            "Spot":
-                round(
-                    spot,
-                    2
-                ),
-
-            "Future":
-                round(
-                    future,
-                    2
-                ),
-
-            "Future - Spot":
-                round(
-                    calc["Difference"],
-                    2
-                ),
-
-            "Lot Size":
-                lot,
-
-            "Gross Profit / Lot":
-                round(
-                    calc["Gross Profit"],
-                    2
-                ),
-
-            "Future Contract Value":
-                round(
-                    calc["Future Value"],
-                    2
-                ),
-
-            "Estimated Final Margin":
-                round(
-                    calc["Estimated Margin"],
-                    2
-                ),
-
-            "Gross ROI %":
-                round(
-                    calc["ROI %"],
-                    2
-                )
+        rows.append({
+            "Stock": stock,
+            "Month": label,
+            "Expiry": expiry.strftime("%d-%b-%Y"),
+            "Spot": round(spot, 2),
+            "Future": round(future, 2),
+            "Future-Spot": round(diff, 2),
+            "Lot Size": lot,
+            "GROSS PROFIT / LOT": round(gross, 2),
+            "Spot Value / Lot": round(spot * lot, 2),
+            "Future Value / Lot": round(future * lot, 2),
+            "Future Bid": fq.get("bid"),
+            "Future Ask": fq.get("ask"),
         })
 
-    result = pd.DataFrame(
-        future_rows
-    )
-
-    if result.empty:
-        return result
-
-    # Highest gross profit first
-    result = result.sort_values(
-        "Gross Profit / Lot",
-        ascending=False
-    ).reset_index(
-        drop=True
-    )
-
-    result.insert(
-        0,
-        "Rank",
-        range(
-            1,
-            len(result) + 1
-        )
-    )
-
-    return result
+    return pd.DataFrame(rows)
 
 
 # ============================================================
-# STOCK OPTIONS MAP
+# OPTION MAP
 # ============================================================
 
-def get_stock_options(
-    master,
-    stock,
-    expiry
-):
+def option_map(master, underlying, expiry, index=False):
+    instrument = "OPTIDX" if index else "OPTSTK"
 
     x = master[
         (master["exchange"] == "NFO")
-        &
-        (master["instrument"] == "OPTSTK")
-        &
-        (master["name"] == stock)
-        &
-        (
-            master["expiry_date"]
-            == expiry
-        )
+        & (master["instrument"] == instrument)
+        & (master["name"] == underlying)
+        & (master["expiry_date"] == expiry)
     ]
 
     result = {}
 
     for _, row in x.iterrows():
-
         strike = row["strike_num"]
-
         if pd.isna(strike):
             continue
 
-        symbol = str(
-            row["symbol"]
-        ).upper()
+        symbol = str(row["symbol"]).upper()
 
         if symbol.endswith("CE"):
-
-            option_type = "CE"
-
+            typ = "CE"
         elif symbol.endswith("PE"):
-
-            option_type = "PE"
-
+            typ = "PE"
         else:
-
             continue
 
-        result[
-            (
-                round(
-                    float(strike),
-                    2
-                ),
-                option_type
-            )
-        ] = {
+        try:
+            lot = int(row["lot_size"])
+        except Exception:
+            continue
 
-            "token":
-                str(row["token"]),
+        if lot <= 0:
+            continue
 
-            "symbol":
-                symbol,
-
-            "lot":
-                int(row["lot_size"])
+        result[(round(float(strike), 2), typ)] = {
+            "token": str(row["token"]),
+            "symbol": symbol,
+            "lot": lot,
         }
 
     return result
 
 
 # ============================================================
-# INDEX OPTIONS MAP
+# PARITY ENGINE
 # ============================================================
 
-def get_index_options(
+def scan_parity_for_underlying(
     master,
-    index_name,
-    expiry
-):
-
-    x = master[
-        (master["exchange"] == "NFO")
-        &
-        (master["instrument"] == "OPTIDX")
-        &
-        (master["name"] == index_name)
-        &
-        (
-            master["expiry_date"]
-            == expiry
-        )
-    ]
-
-    result = {}
-
-    for _, row in x.iterrows():
-
-        strike = row["strike_num"]
-
-        if pd.isna(strike):
-            continue
-
-        symbol = str(
-            row["symbol"]
-        ).upper()
-
-        if symbol.endswith("CE"):
-
-            option_type = "CE"
-
-        elif symbol.endswith("PE"):
-
-            option_type = "PE"
-
-        else:
-
-            continue
-
-        result[
-            (
-                round(
-                    float(strike),
-                    2
-                ),
-                option_type
-            )
-        ] = {
-
-            "token":
-                str(row["token"]),
-
-            "symbol":
-                symbol,
-
-            "lot":
-                int(row["lot_size"])
-        }
-
-    return result
-
-
-# ============================================================
-# PARITY TRADE CALCULATION
-# ============================================================
-
-def parity_calculation(
-    future,
-    strike,
-    ce_bid,
-    ce_ask,
-    pe_bid,
-    pe_ask,
-    future_bid,
-    future_ask,
-    lot
-):
-
-    # --------------------------------------------------------
-    # CE SELL / PE BUY / FUTURE BUY
-    # --------------------------------------------------------
-
-    positive_edge = (
-        ce_bid
-        -
-        pe_ask
-        -
-        (
-            future_ask
-            -
-            strike
-        )
-    )
-
-    # --------------------------------------------------------
-    # CE BUY / PE SELL / FUTURE SELL
-    # --------------------------------------------------------
-
-    negative_edge = (
-        ce_ask
-        -
-        pe_bid
-        -
-        (
-            future_bid
-            -
-            strike
-        )
-    )
-
-    if abs(
-        positive_edge
-    ) >= abs(
-        negative_edge
-    ):
-
-        edge = positive_edge
-
-        trade = (
-            "CE SELL / PE BUY / FUTURE BUY"
-        )
-
-    else:
-
-        edge = negative_edge
-
-        trade = (
-            "CE BUY / PE SELL / FUTURE SELL"
-        )
-
-    gross_profit = (
-        abs(edge)
-        * lot
-    )
-
-    # Conservative estimated margin
-    future_margin = (
-        future
-        * lot
-        * margin_percent
-        / 100
-    )
-
-    # Option premium exposure
-    option_capital = (
-        (
-            ce_ask
-            +
-            pe_ask
-        )
-        * lot
-    )
-
-    estimated_margin = (
-        future_margin
-        +
-        option_capital
-    )
-
-    roi = (
-        gross_profit
-        /
-        estimated_margin
-        *
-        100
-        if estimated_margin > 0
-        else 0
-    )
-
-    return {
-
-        "Edge":
-            edge,
-
-        "Trade":
-            trade,
-
-        "Gross Profit":
-            gross_profit,
-
-        "Future Margin":
-            future_margin,
-
-        "Option Capital":
-            option_capital,
-
-        "Estimated Final Margin":
-            estimated_margin,
-
-        "ROI %":
-            roi
-    }
-
-
-# ============================================================
-# STOCK PARITY ONE MONTH
-# ============================================================
-
-def scan_stock_parity_month(
     jwt,
-    master,
-    stocks,
+    underlying,
     expiry,
-    month_label
+    month_label,
+    index=False,
 ):
-
-    cash_map = create_cash_map(
-        master
-    )
-
-    future_info = {}
-
-    for stock in stocks:
-
-        if stock not in cash_map:
-            continue
-
-        row = get_stock_future(
-            master,
-            stock,
-            expiry
-        )
-
-        if row is None:
-            continue
-
-        future_info[stock] = {
-
-            "future_token":
-                str(row["token"]),
-
-            "cash_token":
-                cash_map[stock]["token"],
-
-            "lot":
-                int(row["lot_size"])
-        }
-
-    if not future_info:
+    if expiry is None:
         return pd.DataFrame()
 
-    future_tokens = [
-        x["future_token"]
-        for x in future_info.values()
-    ]
-
-    cash_tokens = [
-        x["cash_token"]
-        for x in future_info.values()
-    ]
-
-    future_quotes = batch_full_quote(
-        jwt,
-        "NFO",
-        future_tokens
+    fr = (
+        index_future(master, underlying, expiry)
+        if index
+        else future_map(master, expiry).get(underlying)
     )
 
-    cash_quotes = batch_full_quote(
-        jwt,
-        "NSE",
-        cash_tokens
-    )
-
-    rows = []
-
-    for stock, info in future_info.items():
-
-        fq = future_quotes.get(
-            info["future_token"],
-            {}
-        )
-
-        sq = cash_quotes.get(
-            info["cash_token"],
-            {}
-        )
-
-        future = fq.get(
-            "ltp"
-        )
-
-        future_bid = fq.get(
-            "bid"
-        )
-
-        future_ask = fq.get(
-            "ask"
-        )
-
-        spot = sq.get(
-            "ltp"
-        )
-
-        if (
-            future is None
-            or future_bid is None
-            or future_ask is None
-        ):
-            continue
-
-        if spot is None:
-            continue
-
-        if (
-            future_bid <= 0
-            or future_ask <= 0
-        ):
-            continue
-
-        contracts = get_stock_options(
-            master,
-            stock,
-            expiry
-        )
-
-        if not contracts:
-            continue
-
-        all_strikes = sorted(
-            set(
-                strike
-                for (
-                    strike,
-                    option_type
-                ) in contracts
-            ),
-            key=lambda strike:
-                abs(
-                    strike
-                    -
-                    future
-                )
-        )
-
-        strikes = all_strikes[
-            :int(parity_strikes)
-        ]
-
-        option_tokens = []
-
-        for strike in strikes:
-
-            ce = contracts.get(
-                (
-                    strike,
-                    "CE"
-                )
-            )
-
-            pe = contracts.get(
-                (
-                    strike,
-                    "PE"
-                )
-            )
-
-            if ce:
-
-                option_tokens.append(
-                    ce["token"]
-                )
-
-            if pe:
-
-                option_tokens.append(
-                    pe["token"]
-                )
-
-        option_quotes = batch_full_quote(
-            jwt,
-            "NFO",
-            option_tokens
-        )
-
-        for strike in strikes:
-
-            ce = contracts.get(
-                (
-                    strike,
-                    "CE"
-                )
-            )
-
-            pe = contracts.get(
-                (
-                    strike,
-                    "PE"
-                )
-            )
-
-            # CE + PE both mandatory
-            if not ce or not pe:
-                continue
-
-            ceq = option_quotes.get(
-                ce["token"],
-                {}
-            )
-
-            peq = option_quotes.get(
-                pe["token"],
-                {}
-            )
-
-            # =================================================
-            # LIQUID STRIKE CRITERIA
-            # =================================================
-
-            if not quote_is_liquid(
-                ceq,
-                min_option_volume,
-                min_option_oi,
-                max_spread_percent
-            ):
-                continue
-
-            if not quote_is_liquid(
-                peq,
-                min_option_volume,
-                min_option_oi,
-                max_spread_percent
-            ):
-                continue
-
-            # Future must have both sides
-            if (
-                future_bid <= 0
-                or future_ask <= 0
-            ):
-                continue
-
-            calc = parity_calculation(
-                future,
-                strike,
-                ceq["bid"],
-                ceq["ask"],
-                peq["bid"],
-                peq["ask"],
-                future_bid,
-                future_ask,
-                info["lot"]
-            )
-
-            if abs(
-                calc["Edge"]
-            ) < parity_threshold:
-                continue
-
-            rows.append({
-
-                "Month":
-                    month_label,
-
-                "Stock":
-                    stock,
-
-                "Expiry":
-                    pd.Timestamp(
-                        expiry
-                    ).strftime(
-                        "%d-%b-%Y"
-                    ),
-
-                "Spot":
-                    round(
-                        spot,
-                        2
-                    ),
-
-                "Future":
-                    round(
-                        future,
-                        2
-                    ),
-
-                "Strike":
-                    round(
-                        strike,
-                        2
-                    ),
-
-                "Trade":
-                    calc["Trade"],
-
-                "CE Bid":
-                    round(
-                        ceq["bid"],
-                        2
-                    ),
-
-                "CE Ask":
-                    round(
-                        ceq["ask"],
-                        2
-                    ),
-
-                "PE Bid":
-                    round(
-                        peq["bid"],
-                        2
-                    ),
-
-                "PE Ask":
-                    round(
-                        peq["ask"],
-                        2
-                    ),
-
-                "Future Bid":
-                    round(
-                        future_bid,
-                        2
-                    ),
-
-                "Future Ask":
-                    round(
-                        future_ask,
-                        2
-                    ),
-
-                "CE Spread %":
-                    round(
-                        spread_percent(ceq),
-                        2
-                    ),
-
-                "PE Spread %":
-                    round(
-                        spread_percent(peq),
-                        2
-                    ),
-
-                "CE Volume":
-                    ceq.get(
-                        "volume"
-                    ),
-
-                "PE Volume":
-                    peq.get(
-                        "volume"
-                    ),
-
-                "CE OI":
-                    ceq.get(
-                        "oi"
-                    ),
-
-                "PE OI":
-                    peq.get(
-                        "oi"
-                    ),
-
-                "Executable Edge":
-                    round(
-                        calc["Edge"],
-                        2
-                    ),
-
-                "Absolute Edge":
-                    round(
-                        abs(calc["Edge"]),
-                        2
-                    ),
-
-                "Lot Size":
-                    info["lot"],
-
-                "Gross Profit / Lot":
-                    round(
-                        calc["Gross Profit"],
-                        2
-                    ),
-
-                "Future Margin":
-                    round(
-                        calc["Future Margin"],
-                        2
-                    ),
-
-                "Option Capital":
-                    round(
-                        calc["Option Capital"],
-                        2
-                    ),
-
-                "Estimated Final Margin":
-                    round(
-                        calc["Estimated Final Margin"],
-                        2
-                    ),
-
-                "Gross ROI %":
-                    round(
-                        calc["ROI %"],
-                        2
-                    )
-            })
-
-    result = pd.DataFrame(
-        rows
-    )
-
-    if result.empty:
-        return result
-
-    # Highest gross profit first
-    result = result.sort_values(
-        [
-            "Gross Profit / Lot",
-            "Absolute Edge"
-        ],
-        ascending=[
-            False,
-            False
-        ]
-    ).reset_index(
-        drop=True
-    )
-
-    result.insert(
-        0,
-        "Rank",
-        range(
-            1,
-            len(result) + 1
-        )
-    )
-
-    return result
-
-
-# ============================================================
-# INDEX PARITY ONE MONTH
-# ============================================================
-
-def scan_index_parity_month(
-    jwt,
-    master,
-    index_name,
-    expiry,
-    month_label
-):
-
-    x = master[
-        (master["exchange"] == "NFO")
-        &
-        (master["name"] == index_name)
-        &
-        (
-            master["expiry_date"]
-            == expiry
-        )
-    ]
-
-    futures = x[
-        x["instrument"] == "FUTIDX"
-    ]
-
-    if futures.empty:
+    if fr is None:
         return pd.DataFrame()
 
-    future_row = futures.iloc[0]
+    ft = str(fr["token"])
+    fq = batch_full_quote(jwt, "NFO", [ft]).get(ft, {})
 
-    future_token = str(
-        future_row["token"]
-    )
+    future = fq.get("ltp")
+    fb = fq.get("bid")
+    fa = fq.get("ask")
 
-    lot = int(
-        future_row["lot_size"]
-    )
-
-    fq = batch_full_quote(
-        jwt,
-        "NFO",
-        [future_token]
-    ).get(
-        future_token,
-        {}
-    )
-
-    future = fq.get(
-        "ltp"
-    )
-
-    future_bid = fq.get(
-        "bid"
-    )
-
-    future_ask = fq.get(
-        "ask"
-    )
-
-    if (
-        future is None
-        or future_bid is None
-        or future_ask is None
-    ):
+    if future is None or fb is None or fa is None:
         return pd.DataFrame()
 
-    if (
-        future_bid <= 0
-        or future_ask <= 0
-    ):
+    if fb <= 0 or fa <= 0 or fa < fb:
         return pd.DataFrame()
 
-    contracts = get_index_options(
+    contracts = option_map(
         master,
-        index_name,
-        expiry
+        underlying,
+        expiry,
+        index=index,
     )
 
     if not contracts:
         return pd.DataFrame()
 
     strikes = sorted(
-        set(
-            strike
-            for (
-                strike,
-                option_type
-            ) in contracts
-        ),
-        key=lambda strike:
-            abs(
-                strike
-                -
-                future
-            )
-    )[
-        :int(parity_strikes)
-    ]
+        {k[0] for k in contracts},
+        key=lambda z: abs(z - future),
+    )[:int(strike_count)]
 
     tokens = []
 
     for strike in strikes:
+        for typ in ("CE", "PE"):
+            item = contracts.get((strike, typ))
+            if item:
+                tokens.append(item["token"])
 
-        ce = contracts.get(
-            (
-                strike,
-                "CE"
-            )
-        )
-
-        pe = contracts.get(
-            (
-                strike,
-                "PE"
-            )
-        )
-
-        if ce:
-            tokens.append(
-                ce["token"]
-            )
-
-        if pe:
-            tokens.append(
-                pe["token"]
-            )
-
-    quotes = batch_full_quote(
-        jwt,
-        "NFO",
-        tokens
-    )
+    quotes = batch_full_quote(jwt, "NFO", tokens)
 
     rows = []
 
     for strike in strikes:
-
-        ce = contracts.get(
-            (
-                strike,
-                "CE"
-            )
-        )
-
-        pe = contracts.get(
-            (
-                strike,
-                "PE"
-            )
-        )
+        ce = contracts.get((strike, "CE"))
+        pe = contracts.get((strike, "PE"))
 
         if not ce or not pe:
             continue
 
-        ceq = quotes.get(
-            ce["token"],
-            {}
-        )
+        ceq = quotes.get(ce["token"], {})
+        peq = quotes.get(pe["token"], {})
 
-        peq = quotes.get(
-            pe["token"],
-            {}
-        )
-
-        # =====================================================
-        # LIQUID STRIKE
-        # =====================================================
-
-        if not quote_is_liquid(
-            ceq,
-            min_option_volume,
-            min_option_oi,
-            max_spread_percent
-        ):
+        # LIQUID STRIKE CRITERIA IS KEPT
+        if not quote_is_liquid(ceq):
             continue
 
-        if not quote_is_liquid(
-            peq,
-            min_option_volume,
-            min_option_oi,
-            max_spread_percent
-        ):
+        if not quote_is_liquid(peq):
             continue
 
-        calc = parity_calculation(
-            future,
-            strike,
-            ceq["bid"],
-            ceq["ask"],
-            peq["bid"],
-            peq["ask"],
-            future_bid,
-            future_ask,
-            lot
-        )
-
-        if abs(
-            calc["Edge"]
-        ) < parity_threshold:
+        # FUTURE MUST HAVE TWO SIDES
+        if fb <= 0 or fa <= 0:
             continue
+
+        ce_bid = ceq["bid"]
+        ce_ask = ceq["ask"]
+        pe_bid = peq["bid"]
+        pe_ask = peq["ask"]
+
+        # Strategy 1:
+        # SELL CE + BUY PE + BUY FUTURE
+        edge_positive = ce_bid - pe_ask - (fa - strike)
+
+        # Strategy 2:
+        # BUY CE + SELL PE + SELL FUTURE
+        edge_negative = ce_ask - pe_bid - (fb - strike)
+
+        candidates = [
+            (edge_positive, "CE SELL / PE BUY / FUTURE BUY"),
+            (edge_negative, "CE BUY / PE SELL / FUTURE SELL"),
+        ]
+
+        edge, trade = max(candidates, key=lambda x: abs(x[0]))
+
+        if abs(edge) <= parity_threshold:
+            continue
+
+        try:
+            lot = int(fr["lot_size"])
+        except Exception:
+            lot = ce["lot"]
+
+        gross = abs(edge) * lot
+
+        # Conservative displayed margin estimate.
+        # Actual RMS margin can differ.
+        future_margin = future * lot * 0.15
+        option_cash = (ce_ask + pe_ask) * lot
+        estimated_margin = future_margin + option_cash
 
         rows.append({
-
-            "Month":
-                month_label,
-
-            "Index":
-                index_name,
-
-            "Expiry":
-                pd.Timestamp(
-                    expiry
-                ).strftime(
-                    "%d-%b-%Y"
-                ),
-
-            "Future":
-                round(
-                    future,
-                    2
-                ),
-
-            "Strike":
-                round(
-                    strike,
-                    2
-                ),
-
-            "Trade":
-                calc["Trade"],
-
-            "CE Bid":
-                round(
-                    ceq["bid"],
-                    2
-                ),
-
-            "CE Ask":
-                round(
-                    ceq["ask"],
-                    2
-                ),
-
-            "PE Bid":
-                round(
-                    peq["bid"],
-                    2
-                ),
-
-            "PE Ask":
-                round(
-                    peq["ask"],
-                    2
-                ),
-
-            "Future Bid":
-                round(
-                    future_bid,
-                    2
-                ),
-
-            "Future Ask":
-                round(
-                    future_ask,
-                    2
-                ),
-
-            "CE Spread %":
-                round(
-                    spread_percent(ceq),
-                    2
-                ),
-
-            "PE Spread %":
-                round(
-                    spread_percent(peq),
-                    2
-                ),
-
-            "CE Volume":
-                ceq.get(
-                    "volume"
-                ),
-
-            "PE Volume":
-                peq.get(
-                    "volume"
-                ),
-
-            "CE OI":
-                ceq.get(
-                    "oi"
-                ),
-
-            "PE OI":
-                peq.get(
-                    "oi"
-                ),
-
-            "Executable Edge":
-                round(
-                    calc["Edge"],
-                    2
-                ),
-
-            "Absolute Edge":
-                round(
-                    abs(calc["Edge"]),
-                    2
-                ),
-
-            "Lot Size":
-                lot,
-
-            "Gross Profit / Lot":
-                round(
-                    calc["Gross Profit"],
-                    2
-                ),
-
-            "Future Margin":
-                round(
-                    calc["Future Margin"],
-                    2
-                ),
-
-            "Option Capital":
-                round(
-                    calc["Option Capital"],
-                    2
-                ),
-
-            "Estimated Final Margin":
-                round(
-                    calc["Estimated Final Margin"],
-                    2
-                ),
-
-            "Gross ROI %":
-                round(
-                    calc["ROI %"],
-                    2
-                )
+            "Underlying": underlying,
+            "Month": month_label,
+            "Expiry": expiry.strftime("%d-%b-%Y"),
+            "Trade": trade,
+            "Future": round(future, 2),
+            "Future Bid": round(fb, 2),
+            "Future Ask": round(fa, 2),
+            "Strike": round(strike, 2),
+            "CE Bid": round(ce_bid, 2),
+            "CE Ask": round(ce_ask, 2),
+            "PE Bid": round(pe_bid, 2),
+            "PE Ask": round(pe_ask, 2),
+            "CE Spread %": round(spread_pct(ceq), 2),
+            "PE Spread %": round(spread_pct(peq), 2),
+            "CE Volume": ceq.get("volume"),
+            "PE Volume": peq.get("volume"),
+            "CE OI": ceq.get("oi"),
+            "PE OI": peq.get("oi"),
+            "Executable Edge": round(edge, 2),
+            "Absolute Edge": round(abs(edge), 2),
+            "Lot Size": lot,
+            "GROSS PROFIT / TRADE": round(gross, 2),
+            "Estimated Future Margin": round(future_margin, 2),
+            "Estimated Option Margin": round(option_cash, 2),
+            "Estimated FINAL MARGIN": round(estimated_margin, 2),
         })
 
-    result = pd.DataFrame(
-        rows
-    )
+    result = pd.DataFrame(rows)
 
-    if result.empty:
-        return result
+    if not result.empty:
+        result = result.sort_values(
+            ["GROSS PROFIT / TRADE", "Absolute Edge"],
+            ascending=[False, False],
+        ).reset_index(drop=True)
+
+        result.insert(0, "Rank", range(1, len(result) + 1))
+
+    return result
+
+
+# ============================================================
+# 5 STOCK PARTS
+# ============================================================
+
+def stock_list(master, expiry):
+    return sorted(future_map(master, expiry).keys())
+
+
+def split_stocks(stocks, parts):
+    if not stocks:
+        return [[] for _ in range(parts)]
+
+    arrays = np.array_split(stocks, parts)
+    return [list(a) for a in arrays]
+
+
+def scan_stock_part(
+    master,
+    jwt,
+    stocks,
+    current_expiry,
+    next_expiry,
+    part_no,
+):
+    all_rows = []
+
+    for stock in stocks:
+        current = scan_parity_for_underlying(
+            master,
+            jwt,
+            stock,
+            current_expiry,
+            "CURRENT MONTH",
+            index=False,
+        )
+
+        if not current.empty:
+            all_rows.append(current)
+
+        if next_expiry is not None:
+            nxt = scan_parity_for_underlying(
+                master,
+                jwt,
+                stock,
+                next_expiry,
+                "NEXT MONTH",
+                index=False,
+            )
+
+            if not nxt.empty:
+                all_rows.append(nxt)
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    result = pd.concat(all_rows, ignore_index=True)
 
     result = result.sort_values(
-        [
-            "Gross Profit / Lot",
-            "Absolute Edge"
-        ],
-        ascending=[
-            False,
-            False
-        ]
-    ).reset_index(
-        drop=True
-    )
+        "GROSS PROFIT / TRADE",
+        ascending=False,
+    ).reset_index(drop=True)
 
     result.insert(
         0,
+        "Part",
+        part_no,
+    )
+
+    result.insert(
+        1,
         "Rank",
-        range(
-            1,
-            len(result) + 1
-        )
+        range(1, len(result) + 1),
     )
 
     return result
 
 
 # ============================================================
-# SPLIT LIST
+# INDEX SCAN
 # ============================================================
 
-def split_into_parts(
-    items,
-    parts
+def scan_index_both_months(
+    master,
+    jwt,
+    index_name,
+    current_expiry,
+    next_expiry,
 ):
+    frames = []
 
-    items = list(items)
-
-    if not items:
-        return []
-
-    parts = max(
-        1,
-        min(
-            int(parts),
-            len(items)
-        )
+    cur = scan_parity_for_underlying(
+        master,
+        jwt,
+        index_name,
+        current_expiry,
+        "CURRENT MONTH",
+        index=True,
     )
 
-    arrays = np.array_split(
-        np.array(items),
-        parts
-    )
+    if not cur.empty:
+        frames.append(cur)
 
-    return [
-        list(x)
-        for x in arrays
-        if len(x) > 0
-    ]
-
-
-# ============================================================
-# RESULT DISPLAY
-# ============================================================
-
-def display_result(
-    result,
-    filename
-):
-
-    if (
-        result is None
-        or result.empty
-    ):
-
-        st.info(
-            "कोई qualifying liquid result नहीं मिला."
+    if next_expiry is not None:
+        nxt = scan_parity_for_underlying(
+            master,
+            jwt,
+            index_name,
+            next_expiry,
+            "NEXT MONTH",
+            index=True,
         )
 
+        if not nxt.empty:
+            frames.append(nxt)
+
+    if not frames:
+        return pd.DataFrame()
+
+    result = pd.concat(frames, ignore_index=True)
+
+    result = result.sort_values(
+        "GROSS PROFIT / TRADE",
+        ascending=False,
+    ).reset_index(drop=True)
+
+    result.insert(0, "Rank", range(1, len(result) + 1))
+
+    return result
+
+
+# ============================================================
+# DISPLAY / DOWNLOAD
+# ============================================================
+
+def show_table(df, filename):
+    if df is None or df.empty:
+        st.info("कोई qualifying liquid result नहीं मिला।")
         return
 
     st.dataframe(
-        result,
+        df,
         use_container_width=True,
         hide_index=True,
-        height=600
+        height=600,
     )
 
-    csv_data = (
-        result
-        .to_csv(index=False)
-        .encode("utf-8")
-    )
+    csv = df.to_csv(index=False).encode("utf-8")
 
     st.download_button(
-        label="⬇️ Download Editable CSV / Excel में खोलें",
-        data=csv_data,
+        "⬇️ Download CSV / Excel में खोलें",
+        data=csv,
         file_name=filename,
         mime="text/csv",
-        use_container_width=True
+        use_container_width=True,
     )
 
 
 # ============================================================
-# LOAD MASTER
+# STARTUP
 # ============================================================
 
-with st.spinner(
-    "Angel master loading..."
-):
+st.title("📊 Fast & Furious Market Scanner PRO")
 
-    try:
-
-        master_raw = download_master()
-
-        master = prepare_master(
-            master_raw
-        )
-
-    except Exception as e:
-
-        st.error(
-            "Master loading error: "
-            + str(e)
-        )
-
-        st.stop()
-
-
-# ============================================================
-# LOGIN
-# ============================================================
-
-if "jwt" not in st.session_state:
-
-    st.session_state[
-        "jwt"
-    ] = None
-
-
-st.sidebar.divider()
-
-if st.sidebar.button(
-    "🔐 Connect Angel One",
-    use_container_width=True
-):
-
-    try:
-
-        with st.spinner(
-            "Angel One login..."
-        ):
-
-            st.session_state[
-                "jwt"
-            ] = angel_login()
-
-        st.sidebar.success(
-            "Angel One Connected ✅"
-        )
-
-    except Exception as e:
-
-        st.sidebar.error(
-            str(e)
-        )
-
-
-jwt = st.session_state.get(
-    "jwt"
+st.caption(
+    "Current + Next Month | Liquid Strike | "
+    "Executable Bid/Ask Parity | Future > Spot"
 )
 
-
-if not jwt:
-
-    st.warning(
-        "ऊपर Sidebar में पहले "
-        "**Connect Angel One** दबाएँ."
+if not all([API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET]):
+    st.error(
+        "Angel One Secrets missing. Streamlit Secrets में ये चार values रखें: "
+        "ANGEL_API_KEY, ANGEL_CLIENT_CODE, "
+        "ANGEL_PASSWORD, ANGEL_TOTP_SECRET"
     )
-
     st.stop()
 
+try:
+    master = prepare_master(download_master())
+except Exception as e:
+    st.error("Master load error: " + str(e))
+    st.stop()
+
+if "jwt" not in st.session_state:
+    st.session_state.jwt = None
+
+if st.button(
+    "🔐 Connect Angel One",
+    type="primary",
+    use_container_width=True,
+):
+    try:
+        st.session_state.jwt = login()
+        st.success("Angel One Connected ✅")
+    except Exception as e:
+        st.error("Login Error: " + str(e))
+
+jwt = st.session_state.jwt
+
+if not jwt:
+    st.warning("पहले Connect Angel One दबाएँ।")
+    st.stop()
+
+current_expiry, next_expiry = current_next_expiry(master)
+
+if current_expiry is None:
+    st.error("Current month expiry नहीं मिली।")
+    st.stop()
+
+st.success(
+    "Current: " + current_expiry.strftime("%d-%b-%Y")
+    + " | Next: "
+    + (
+        next_expiry.strftime("%d-%b-%Y")
+        if next_expiry is not None
+        else "Not Available"
+    )
+)
 
 # ============================================================
 # 1. FUTURE > SPOT
 # ============================================================
 
 st.divider()
-
-st.header(
-    "1️⃣ ⚡ Future > Spot — Current + Next Month"
-)
-
-st.caption(
-    "Current और Next month दोनों futures को Spot से compare किया जाएगा. "
-    "Future > Spot होने पर lot-wise gross profit निकलेगा."
-)
+st.header("1️⃣ ⚡ Future > Spot — Current + Next Month")
 
 if st.button(
-    "🚀 Scan Future > Spot",
-    key="future_spot_scan",
+    "🚀 Scan Current + Next Month Future > Spot",
+    key="future_spot",
     type="primary",
-    use_container_width=True
+    use_container_width=True,
 ):
+    frames = []
 
-    with st.spinner(
-        "Current + Next month Future > Spot scanning..."
-    ):
+    with st.spinner("Current month Future > Spot..."):
+        cur = calculate_future_spot(
+            master,
+            jwt,
+            current_expiry,
+            "CURRENT MONTH",
+        )
 
-        try:
+    if not cur.empty:
+        frames.append(cur)
 
-            result = scan_future_spot(
+    if next_expiry is not None:
+        with st.spinner("Next month Future > Spot..."):
+            nxt = calculate_future_spot(
+                master,
                 jwt,
-                master
+                next_expiry,
+                "NEXT MONTH",
             )
 
-            st.session_state[
-                "future_spot_result"
-            ] = result
+        if not nxt.empty:
+            frames.append(nxt)
 
-        except Exception as e:
+    if frames:
+        result = pd.concat(frames, ignore_index=True)
+        result = result.sort_values(
+            "GROSS PROFIT / LOT",
+            ascending=False,
+        ).reset_index(drop=True)
+        result.insert(0, "Rank", range(1, len(result) + 1))
+    else:
+        result = pd.DataFrame()
 
-            st.error(
-                "Future > Spot Error: "
-                + str(e)
-            )
+    st.session_state.future_result = result
 
-
-future_result = st.session_state.get(
-    "future_spot_result",
-    pd.DataFrame()
+show_table(
+    st.session_state.get("future_result", pd.DataFrame()),
+    "future_spot_current_next.csv",
 )
-
-display_result(
-    future_result,
-    "future_spot_current_next.csv"
-)
-
 
 # ============================================================
-# 2. STOCK PARTS
+# 2-6. STOCK PARITY 5 PARTS
 # ============================================================
 
 st.divider()
-
-st.header(
-    "2️⃣ ⚖️ Stock Put-Call Parity"
-)
+st.header("2️⃣ ⚖️ Stock Put-Call Parity — 5 Independent Parts")
 
 st.caption(
-    "Current + Next month parity | "
-    "Liquid CE + PE + Future mandatory | "
-    "5 independent parts"
+    "Liquid strike criteria ACTIVE: CE + PE volume/OI + "
+    "Bid/Ask + spread + Future Bid/Ask."
 )
 
+stocks = stock_list(master, current_expiry)
+parts = split_stocks(stocks, int(stock_parts))
 
-fno_stocks = sorted(
-    master[
-        (master["exchange"] == "NFO")
-        &
-        (master["instrument"] == "FUTSTK")
-    ]["name"]
-    .dropna()
-    .unique()
-    .tolist()
-)
-
-stock_parts_list = split_into_parts(
-    fno_stocks,
-    stock_parts
-)
-
-
-for index, stock_list in enumerate(
-    stock_parts_list,
-    start=1
-):
+for i in range(int(stock_parts)):
+    part_no = i + 1
 
     st.subheader(
-        f"Part {index} — {len(stock_list)} Stocks"
-    )
-
-    button_key = (
-        "stock_parity_part_"
-        + str(index)
-    )
-
-    result_key = (
-        "stock_parity_result_"
-        + str(index)
+        f"Part {part_no} — {len(parts[i])} Stocks"
     )
 
     if st.button(
-        f"🚀 Run Stock Parity Part {index}",
-        key=button_key,
+        f"🚀 Run Stock Parity Part {part_no}",
+        key=f"stock_part_{part_no}",
         type="primary",
-        use_container_width=True
+        use_container_width=True,
     ):
-
         with st.spinner(
-            f"Part {index}: Current + Next month liquid parity..."
+            f"Part {part_no}: Current + Next Month liquid parity..."
         ):
+            result = scan_stock_part(
+                master,
+                jwt,
+                parts[i],
+                current_expiry,
+                next_expiry,
+                part_no,
+            )
 
-            all_results = []
+        st.session_state[
+            f"stock_result_{part_no}"
+        ] = result
 
-            for stock in stock_list:
-
-                try:
-
-                    expiries = get_future_expiries(
-                        master,
-                        stock
-                    )
-
-                    if len(expiries) < 2:
-                        continue
-
-                    current_expiry = (
-                        expiries[0]
-                    )
-
-                    next_expiry = (
-                        expiries[1]
-                    )
-
-                    current_result = (
-                        scan_stock_parity_month(
-                            jwt,
-                            master,
-                            [stock],
-                            current_expiry,
-                            "Current Month"
-                        )
-                    )
-
-                    next_result = (
-                        scan_stock_parity_month(
-                            jwt,
-                            master,
-                            [stock],
-                            next_expiry,
-                            "Next Month"
-                        )
-                    )
-
-                    if (
-                        current_result is not None
-                        and
-                        not current_result.empty
-                    ):
-
-                        all_results.append(
-                            current_result
-                        )
-
-                    if (
-                        next_result is not None
-                        and
-                        not next_result.empty
-                    ):
-
-                        all_results.append(
-                            next_result
-                        )
-
-                except Exception:
-
-                    continue
-
-            if all_results:
-
-                result = pd.concat(
-                    all_results,
-                    ignore_index=True
-                )
-
-                result = result.sort_values(
-                    [
-                        "Gross Profit / Lot",
-                        "Absolute Edge"
-                    ],
-                    ascending=[
-                        False,
-                        False
-                    ]
-                ).reset_index(
-                    drop=True
-                )
-
-                result["Rank"] = range(
-                    1,
-                    len(result) + 1
-                )
-
-                cols = [
-                    "Rank"
-                ] + [
-                    c for c in result.columns
-                    if c != "Rank"
-                ]
-
-                result = result[
-                    cols
-                ]
-
-            else:
-
-                result = pd.DataFrame()
-
-            st.session_state[
-                result_key
-            ] = result
-
-    display_result(
+    show_table(
         st.session_state.get(
-            result_key,
-            pd.DataFrame()
+            f"stock_result_{part_no}",
+            pd.DataFrame(),
         ),
-        f"stock_parity_part_{index}.csv"
+        f"stock_parity_part_{part_no}.csv",
     )
 
-
 # ============================================================
-# 3. NIFTY
+# 7. NIFTY
 # ============================================================
 
 st.divider()
-
-st.header(
-    "3️⃣ 📊 NIFTY Liquid Put-Call Parity"
-)
-
-st.caption(
-    "Current month + Next month | Liquid strikes only"
-)
+st.header("7️⃣ 📊 NIFTY Liquid Put-Call Parity")
 
 if st.button(
-    "🚀 Scan NIFTY Current + Next",
+    "🚀 Scan NIFTY Current + Next Month",
     key="nifty_scan",
     type="primary",
-    use_container_width=True
+    use_container_width=True,
 ):
+    with st.spinner("NIFTY liquid parity..."):
+        result = scan_index_both_months(
+            master,
+            jwt,
+            "NIFTY",
+            current_expiry,
+            next_expiry,
+        )
 
-    with st.spinner(
-        "NIFTY current + next month parity..."
-    ):
+    st.session_state.nifty_result = result
 
-        try:
-
-            expiries = get_index_expiries(
-                master,
-                "NIFTY"
-            )
-
-            results = []
-
-            if len(expiries) >= 1:
-
-                r1 = scan_index_parity_month(
-                    jwt,
-                    master,
-                    "NIFTY",
-                    expiries[0],
-                    "Current Month"
-                )
-
-                if not r1.empty:
-                    results.append(r1)
-
-            if len(expiries) >= 2:
-
-                r2 = scan_index_parity_month(
-                    jwt,
-                    master,
-                    "NIFTY",
-                    expiries[1],
-                    "Next Month"
-                )
-
-                if not r2.empty:
-                    results.append(r2)
-
-            if results:
-
-                result = pd.concat(
-                    results,
-                    ignore_index=True
-                )
-
-                result = result.sort_values(
-                    "Gross Profit / Lot",
-                    ascending=False
-                ).reset_index(
-                    drop=True
-                )
-
-                result.insert(
-                    0,
-                    "Rank",
-                    range(
-                        1,
-                        len(result) + 1
-                    )
-                )
-
-            else:
-
-                result = pd.DataFrame()
-
-            st.session_state[
-                "nifty_result"
-            ] = result
-
-        except Exception as e:
-
-            st.error(
-                "NIFTY Error: "
-                + str(e)
-            )
-
-
-display_result(
-    st.session_state.get(
-        "nifty_result",
-        pd.DataFrame()
-    ),
-    "nifty_current_next_parity.csv"
+show_table(
+    st.session_state.get("nifty_result", pd.DataFrame()),
+    "nifty_parity_current_next.csv",
 )
 
-
 # ============================================================
-# 4. BANKNIFTY
+# 8. BANKNIFTY
 # ============================================================
 
 st.divider()
-
-st.header(
-    "4️⃣ 🏦 BANKNIFTY Liquid Put-Call Parity"
-)
-
-st.caption(
-    "Current month + Next month | Liquid strikes only"
-)
+st.header("8️⃣ 🏦 BANKNIFTY Liquid Put-Call Parity")
 
 if st.button(
-    "🚀 Scan BANKNIFTY Current + Next",
+    "🚀 Scan BANKNIFTY Current + Next Month",
     key="banknifty_scan",
     type="primary",
-    use_container_width=True
+    use_container_width=True,
 ):
+    with st.spinner("BANKNIFTY liquid parity..."):
+        result = scan_index_both_months(
+            master,
+            jwt,
+            "BANKNIFTY",
+            current_expiry,
+            next_expiry,
+        )
 
-    with st.spinner(
-        "BANKNIFTY current + next month parity..."
-    ):
+    st.session_state.banknifty_result = result
 
-        try:
-
-            expiries = get_index_expiries(
-                master,
-                "BANKNIFTY"
-            )
-
-            results = []
-
-            if len(expiries) >= 1:
-
-                r1 = scan_index_parity_month(
-                    jwt,
-                    master,
-                    "BANKNIFTY",
-                    expiries[0],
-                    "Current Month"
-                )
-
-                if not r1.empty:
-                    results.append(r1)
-
-            if len(expiries) >= 2:
-
-                r2 = scan_index_parity_month(
-                    jwt,
-                    master,
-                    "BANKNIFTY",
-                    expiries[1],
-                    "Next Month"
-                )
-
-                if not r2.empty:
-                    results.append(r2)
-
-            if results:
-
-                result = pd.concat(
-                    results,
-                    ignore_index=True
-                )
-
-                result = result.sort_values(
-                    "Gross Profit / Lot",
-                    ascending=False
-                ).reset_index(
-                    drop=True
-                )
-
-                result.insert(
-                    0,
-                    "Rank",
-                    range(
-                        1,
-                        len(result) + 1
-                    )
-                )
-
-            else:
-
-                result = pd.DataFrame()
-
-            st.session_state[
-                "banknifty_result"
-            ] = result
-
-        except Exception as e:
-
-            st.error(
-                "BANKNIFTY Error: "
-                + str(e)
-            )
-
-
-display_result(
-    st.session_state.get(
-        "banknifty_result",
-        pd.DataFrame()
-    ),
-    "banknifty_current_next_parity.csv"
+show_table(
+    st.session_state.get("banknifty_result", pd.DataFrame()),
+    "banknifty_parity_current_next.csv",
 )
-
 
 # ============================================================
 # RULES
 # ============================================================
 
 st.divider()
-
-st.header(
-    "ℹ️ Scanner Rules"
-)
+st.header("ℹ️ Scanner Rules")
 
 st.markdown(
-    """
-### ⚡ Future > Spot
+"""
+### Future > Spot
+- Current month और next month दोनों scan
+- Spot LTP और Future LTP
+- Future > Spot ही result में
+- Lot size अलग-अलग expiry से
+- `Future - Spot × Lot Size = GROSS PROFIT / LOT`
+- Highest gross profit ऊपर
 
-Current और Next month दोनों Future contracts check होंगे:
-
-- Spot LTP
-- Future LTP
-- Future − Spot
-- Lot Size
-- **Gross Profit = (Future − Spot) × Lot Size**
-- Estimated Final Margin
-- Gross ROI %
-
-जिस contract का **Gross Profit / Lot ज्यादा होगा, वह ऊपर आएगा।**
-
----
-
-### ⚖️ Stock / Index Put-Call Parity
-
-**Liquid strike criteria हटाया नहीं गया है।**
-
-हर strike के लिए:
-
-- CE Bid जरूरी
-- CE Ask जरूरी
-- PE Bid जरूरी
-- PE Ask जरूरी
-- Future Bid जरूरी
-- Future Ask जरूरी
+### Stock / Index Parity
+- Current month + next month दोनों
+- Liquid strike criteria **हटा नहीं है**
+- CE Bid + Ask mandatory
+- PE Bid + Ask mandatory
+- Future Bid + Ask mandatory
 - CE minimum Volume
 - PE minimum Volume
 - CE minimum OI
 - PE minimum OI
-- CE maximum Bid/Ask spread
-- PE maximum Bid/Ask spread
-- Zero/stale quotes reject
-- CE और PE दोनों liquid होना जरूरी
+- Maximum Bid/Ask spread
+- Zero/stale quotes rejected
+- Executable Bid/Ask edge
+- Gross profit = Absolute executable edge × lot size
+- Estimated final margin अलग column में
 
-इसके बाद **Executable Bid/Ask parity** निकाली जाती है।
-
----
-
-### 💰 Gross Profit
-
-Parity में:
-
-**Executable Edge × Lot Size = Gross Profit / Lot**
-
-और साथ में:
-
-- Future Margin
-- Option Capital
-- Estimated Final Margin
-- Gross ROI %
-
-दिखाया जाएगा।
-
----
-
-### 📅 Expiry
-
-हर stock/index के लिए:
-
-**1. Current available expiry**
-
-**2. Next available expiry**
-
-दोनों अलग-अलग scan होंगे।
-
----
-
-### 📊 Stock Scanner
-
-Stock universe को **5 independent parts** में बाँटा गया है।
-
-Part 1, Part 2, Part 3, Part 4 और Part 5 को अलग-अलग run कर सकते हैं।
-
-इससे एक साथ पूरा heavy request भेजने के बजाय load कम रहेगा।
-
----
-
-### 📥 CSV
-
-हर result के नीचे CSV download मिलेगा।
-
-CSV को Excel में खोलकर/edit किया जा सकता है।
+### Important
+`Estimated FINAL MARGIN` conservative estimate है। Actual Angel One RMS margin market conditions, hedge benefit और exchange/broker rules के अनुसार अलग हो सकता है।
 """
 )
 
-st.caption(
-    "📡 Live data: Angel One SmartAPI"
-)
-
-st.caption(
-    "⚠️ Estimated Final Margin केवल scanner estimate है। "
-    "Actual RMS margin broker/exchange के अनुसार बदल सकता है।"
-)
+st.caption("Live data: Angel One SmartAPI")
+'''
+path = "/mnt/data/app.py"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(code)
+print(path)
