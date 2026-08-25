@@ -4,43 +4,111 @@ import pandas as pd
 import numpy as np
 import pyotp
 import time
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
 # PAGE
 # ============================================================
 
 st.set_page_config(
-    page_title="Fast Market Scanner",
-    page_icon="📊",
+    page_title="Fast F&O Parity Scanner",
+    page_icon="⚡",
     layout="wide"
 )
 
-st.title("📊 Fast & Furious Market Scanner")
+st.title("⚡ Fast F&O Put-Call Parity Scanner")
 
 IST = ZoneInfo("Asia/Kolkata")
 
 BASE_URL = "https://apiconnect.angelone.in"
 
+QUOTE_URL = (
+    BASE_URL
+    + "/rest/secure/angelbroking/market/v1/quote/"
+)
+
+MARGIN_URL = (
+    BASE_URL
+    + "/rest/secure/angelbroking/margin/v1/batch"
+)
+
 # ============================================================
-# SETTINGS
+# USER SETTINGS
 # ============================================================
 
-MIN_EDGE = 0.50
+STRIKES_EACH_SIDE = 12
 
-# ATM +/- 10 = maximum 21 strikes
-STRIKES_EACH_SIDE = 10
+MIN_EDGE = 1.0
+
+HIGH_EDGE_LOT = 5000.0
+
+HIGH_ROM = 1.0
+
+QUOTE_BATCH_SIZE = 50
+
+QUOTE_SLEEP = 1.05
+
+BACKGROUND_SECONDS = 20
+
+# ============================================================
+# WHATSAPP
+# ============================================================
+#
+# अभी number नहीं दिया गया है इसलिए OFF है।
+#
+# बाद में अपना WhatsApp API/Webhook लगाने पर
+# सिर्फ यही section बदलना होगा.
+#
+# ============================================================
+
+WHATSAPP_ENABLED = False
+WHATSAPP_NUMBER = ""
+
+# ============================================================
+# GLOBAL BACKGROUND STORAGE
+# ============================================================
+
+if "bg_results" not in st.session_state:
+    st.session_state["bg_results"] = pd.DataFrame()
+
+if "bg_last_scan" not in st.session_state:
+    st.session_state["bg_last_scan"] = ""
+
+if "bg_status" not in st.session_state:
+    st.session_state["bg_status"] = "Stopped"
+
+if "alert_history" not in st.session_state:
+    st.session_state["alert_history"] = []
+
+# Process-level shared cache
+if "parity_global_store" not in st.session_state:
+    st.session_state["parity_global_store"] = {}
 
 # ============================================================
 # SECRETS
 # ============================================================
 
-API_KEY = st.secrets.get("ANGEL_API_KEY", "")
-CLIENT_ID = st.secrets.get("ANGEL_CLIENT_CODE", "")
-PASSWORD = st.secrets.get("ANGEL_PASSWORD", "")
-TOTP_SECRET = st.secrets.get("ANGEL_TOTP_SECRET", "")
+API_KEY = st.secrets.get(
+    "ANGEL_API_KEY",
+    ""
+)
+
+CLIENT_ID = st.secrets.get(
+    "ANGEL_CLIENT_CODE",
+    ""
+)
+
+PASSWORD = st.secrets.get(
+    "ANGEL_PASSWORD",
+    ""
+)
+
+TOTP_SECRET = st.secrets.get(
+    "ANGEL_TOTP_SECRET",
+    ""
+)
 
 if not API_KEY:
     st.error("ANGEL_API_KEY नहीं मिला")
@@ -71,7 +139,6 @@ BASE_HEADERS = {
 
 # ============================================================
 # NIFTY 50
-# Used only by RSI + Future/Spot scanners
 # ============================================================
 
 NIFTY_50 = [
@@ -136,19 +203,20 @@ def now_ist():
 
 
 def auth_headers(jwt):
-    headers = BASE_HEADERS.copy()
-    headers["Authorization"] = "Bearer " + jwt
-    return headers
+    h = BASE_HEADERS.copy()
+    h["Authorization"] = "Bearer " + jwt
+    return h
 
 
 # ============================================================
 # LOGIN
 # ============================================================
 
-@st.cache_data(ttl=1500, show_spinner=False)
 def login():
 
-    totp = pyotp.TOTP(TOTP_SECRET).now()
+    totp = pyotp.TOTP(
+        TOTP_SECRET
+    ).now()
 
     url = (
         BASE_URL
@@ -162,14 +230,14 @@ def login():
         "totp": totp
     }
 
-    response = requests.post(
+    r = requests.post(
         url,
         json=payload,
         headers=BASE_HEADERS,
         timeout=20
     )
 
-    data = response.json()
+    data = r.json()
 
     if data.get("status") is not True:
         raise Exception(
@@ -189,7 +257,7 @@ def login():
 # MASTER
 # ============================================================
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800)
 def download_master():
 
     url = (
@@ -197,14 +265,14 @@ def download_master():
         "OpenAPI_File/files/OpenAPIScripMaster.json"
     )
 
-    response = requests.get(
+    r = requests.get(
         url,
         timeout=60
     )
 
-    response.raise_for_status()
+    r.raise_for_status()
 
-    data = response.json()
+    data = r.json()
 
     if not data:
         raise Exception(
@@ -214,7 +282,7 @@ def download_master():
     return pd.DataFrame(data)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800)
 def prepare_master(master):
 
     df = master.copy()
@@ -278,749 +346,169 @@ def prepare_master(master):
 # FULL QUOTE
 # ============================================================
 
-def extract_bid_ask(item):
-
-    bid = None
-    ask = None
-
-    # --------------------------------------------------------
-    # Direct fields
-    # --------------------------------------------------------
-
-    for key in [
-        "bid",
-        "bidPrice",
-        "bestBid",
-        "buyPrice"
-    ]:
-
-        value = item.get(key)
-
-        if value is not None:
-
-            try:
-                bid = float(value)
-                break
-            except Exception:
-                pass
-
-    for key in [
-        "ask",
-        "askPrice",
-        "bestAsk",
-        "sellPrice"
-    ]:
-
-        value = item.get(key)
-
-        if value is not None:
-
-            try:
-                ask = float(value)
-                break
-            except Exception:
-                pass
-
-    # --------------------------------------------------------
-    # Angel FULL quote depth
-    # --------------------------------------------------------
-
-    depth = item.get("depth") or {}
-
-    buy_depth = depth.get("buy") or []
-    sell_depth = depth.get("sell") or []
-
-    if bid is None and buy_depth:
-
-        bid_prices = []
-
-        for level in buy_depth:
-
-            if not isinstance(level, dict):
-                continue
-
-            value = level.get("price")
-
-            try:
-
-                if value is not None:
-                    bid_prices.append(
-                        float(value)
-                    )
-
-            except Exception:
-                pass
-
-        if bid_prices:
-            bid = max(bid_prices)
-
-    if ask is None and sell_depth:
-
-        ask_prices = []
-
-        for level in sell_depth:
-
-            if not isinstance(level, dict):
-                continue
-
-            value = level.get("price")
-
-            try:
-
-                if value is not None:
-                    ask_prices.append(
-                        float(value)
-                    )
-
-            except Exception:
-                pass
-
-        if ask_prices:
-            ask = min(ask_prices)
-
-    return bid, ask
-
-
-# ============================================================
-# FAST BATCH FULL QUOTE
-# ============================================================
-
-def batch_full_quotes(
+def full_quote_batch(
     jwt,
-    exchange,
-    tokens
+    exchange_tokens
 ):
-
-    tokens = list(
-        dict.fromkeys(
-            str(token)
-            for token in tokens
-            if str(token)
-        )
-    )
-
-    if not tokens:
-        return {}
-
-    url = (
-        BASE_URL
-        + "/rest/secure/angelbroking/"
-        + "market/v1/quote/"
-    )
-
-    headers = auth_headers(jwt)
 
     result = {}
 
-    # Angel API batch
-    for start in range(
-        0,
-        len(tokens),
-        50
-    ):
+    for exchange, tokens in exchange_tokens.items():
 
-        batch = tokens[
-            start:start + 50
+        tokens = [
+            str(x)
+            for x in tokens
+            if str(x)
         ]
 
-        payload = {
-            "mode": "FULL",
-            "exchangeTokens": {
-                exchange: batch
+        tokens = list(
+            dict.fromkeys(tokens)
+        )
+
+        for i in range(
+            0,
+            len(tokens),
+            QUOTE_BATCH_SIZE
+        ):
+
+            batch = tokens[
+                i:i + QUOTE_BATCH_SIZE
+            ]
+
+            payload = {
+                "mode": "FULL",
+                "exchangeTokens": {
+                    exchange: batch
+                }
             }
-        }
 
-        try:
+            try:
 
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=15
-            )
-
-            data = response.json()
-
-            if data.get("status") is not True:
-                continue
-
-            fetched = (
-                data.get("data", {})
-                .get("fetched", [])
-            )
-
-            for item in fetched:
-
-                token = str(
-                    item.get(
-                        "symbolToken",
-                        ""
-                    )
+                r = requests.post(
+                    QUOTE_URL,
+                    json=payload,
+                    headers=auth_headers(jwt),
+                    timeout=20
                 )
 
-                if not token:
+                data = r.json()
+
+                if data.get("status") is not True:
                     continue
 
-                ltp = item.get("ltp")
+                fetched = (
+                    data.get(
+                        "data",
+                        {}
+                    ).get(
+                        "fetched",
+                        []
+                    )
+                )
 
-                try:
+                for item in fetched:
 
-                    ltp = (
-                        float(ltp)
-                        if ltp is not None
-                        else None
+                    token = str(
+                        item.get(
+                            "symbolToken",
+                            ""
+                        )
                     )
 
-                except Exception:
-
-                    ltp = None
-
-                bid, ask = extract_bid_ask(
-                    item
-                )
-
-                result[token] = {
-                    "ltp": ltp,
-                    "bid": bid,
-                    "ask": ask
-                }
-
-        except Exception:
-            continue
-
-    return result
-
-
-# ============================================================
-# HISTORICAL
-# ============================================================
-
-def historical(
-    jwt,
-    token,
-    interval="ONE_DAY",
-    days=180
-):
-
-    url = (
-        BASE_URL
-        + "/rest/secure/angelbroking/"
-        + "historical/v1/getCandleData"
-    )
-
-    end = now_ist()
-
-    start = (
-        end
-        - pd.Timedelta(days=days)
-    )
-
-    payload = {
-        "exchange": "NSE",
-        "symboltoken": str(token),
-        "interval": interval,
-        "fromdate": start.strftime(
-            "%Y-%m-%d %H:%M"
-        ),
-        "todate": end.strftime(
-            "%Y-%m-%d %H:%M"
-        )
-    }
-
-    try:
-
-        response = requests.post(
-            url,
-            json=payload,
-            headers=auth_headers(jwt),
-            timeout=20
-        )
-
-        data = response.json()
-
-        if data.get("status") is not True:
-            return pd.DataFrame()
-
-        candles = data.get("data") or []
-
-        if not candles:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(
-            candles,
-            columns=[
-                "datetime",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume"
-            ]
-        )
-
-        for column in [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
-        ]:
-
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce"
-            )
-
-        df = df.dropna(
-            subset=[
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume"
-            ]
-        )
-
-        return (
-            df.sort_values("datetime")
-            .reset_index(drop=True)
-        )
-
-    except Exception:
-
-        return pd.DataFrame()
-
-
-# ============================================================
-# RSI
-# ============================================================
-
-def rsi(
-    series,
-    period=14
-):
-
-    delta = series.diff()
-
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
-
-    rs = (
-        avg_gain
-        /
-        avg_loss.replace(
-            0,
-            np.nan
-        )
-    )
-
-    return 100 - (
-        100 / (1 + rs)
-    )
-
-
-# ============================================================
-# OBV
-# ============================================================
-
-def obv(df):
-
-    direction = np.sign(
-        df["close"].diff()
-    ).fillna(0)
-
-    return (
-        direction
-        *
-        df["volume"]
-    ).cumsum()
-
-
-# ============================================================
-# RISING
-# ============================================================
-
-def rising(
-    series,
-    lookback=6
-):
-
-    s = series.dropna()
-
-    if len(s) < lookback:
-        return False
-
-    x = s.iloc[
-        -lookback:
-    ]
-
-    overall = (
-        x.iloc[-1]
-        >
-        x.iloc[0]
-    )
-
-    rising_count = (
-        x.diff()
-        .dropna()
-        .gt(0)
-        .sum()
-    )
-
-    return (
-        overall
-        and
-        rising_count >= 3
-    )
-
-
-# ============================================================
-# PRICE FALL SIDEWAYS
-# ============================================================
-
-def price_fall_sideways(df):
-
-    if len(df) < 30:
-        return False
-
-    close = df["close"]
-
-    previous_high = (
-        close.iloc[:-8].max()
-    )
-
-    recent_low = (
-        close.iloc[-8:].min()
-    )
-
-    if previous_high <= 0:
-        return False
-
-    if recent_low >= previous_high:
-        return False
-
-    recent = close.iloc[-8:]
-
-    up_moves = (
-        recent.diff() > 0
-    ).sum()
-
-    down_moves = (
-        recent.diff() < 0
-    ).sum()
-
-    return (
-        up_moves >= 2
-        and
-        down_moves >= 2
-    )
-
-
-# ============================================================
-# SMA
-# ============================================================
-
-def sma20(df):
-
-    if len(df) < 20:
-        return None
-
-    return float(
-        df["close"]
-        .rolling(20)
-        .mean()
-        .iloc[-1]
-    )
-
-
-def sma20_within_1_percent(
-    price,
-    sma
-):
-
-    if sma is None or sma <= 0:
-        return "NO"
-
-    distance = (
-        abs(price - sma)
-        / sma
-    ) * 100
-
-    return (
-        "YES"
-        if distance <= 1
-        else "NO"
-    )
-
-
-# ============================================================
-# RSI BEFORE SIDEWAYS
-# ============================================================
-
-def rsi_before_sideways(df):
-
-    if len(df) < 30:
-        return "Not Enough Data"
-
-    x = df.copy()
-
-    x["RSI"] = rsi(
-        x["close"]
-    )
-
-    sideways_start = (
-        len(x) - 8
-    )
-
-    before = x["RSI"].iloc[
-        max(
-            0,
-            sideways_start - 6
-        ):
-        sideways_start
-    ]
-
-    after = x["RSI"].iloc[
-        sideways_start:
-    ]
-
-    before_yes = (
-        len(before) >= 4
-        and
-        rising(
-            before,
-            min(
-                5,
-                len(before)
-            )
-        )
-    )
-
-    after_yes = (
-        len(after) >= 4
-        and
-        rising(
-            after,
-            min(
-                6,
-                len(after)
-            )
-        )
-    )
-
-    if before_yes and after_yes:
-        return (
-            "⭐ RSI Rising Before Sideways"
-        )
-
-    if before_yes:
-        return (
-            "⭐ RSI Rising Before Sideways"
-        )
-
-    if after_yes:
-        return (
-            "⚡ RSI Rising During Sideways"
-        )
-
-    return "NO"
-
-
-# ============================================================
-# CASH TOKEN MAP
-# ============================================================
-
-def cash_token_map(master):
-
-    cash = master[
-        (master["exchange"] == "NSE")
-        &
-        master["symbol"].str.endswith(
-            "-EQ"
-        )
-    ]
-
-    result = {}
-
-    for _, row in cash.iterrows():
-
-        stock = (
-            row["symbol"]
-            .replace(
-                "-EQ",
-                ""
-            )
-            .strip()
-        )
-
-        result[stock] = {
-            "symbol": row["symbol"],
-            "token": str(row["token"])
-        }
-
-    return result
-
-
-# ============================================================
-# RSI SCANNER
-# ============================================================
-
-def scan_rsi(
-    jwt,
-    master
-):
-
-    tokens = cash_token_map(
-        master
-    )
-
-    rows = []
-
-    def worker(stock):
-
-        if stock not in tokens:
-            return None
-
-        df = historical(
-            jwt,
-            tokens[stock]["token"],
-            "ONE_DAY",
-            180
-        )
-
-        if df.empty or len(df) < 30:
-            return None
-
-        if not price_fall_sideways(df):
-            return None
-
-        df["RSI"] = rsi(
-            df["close"]
-        )
-
-        df["OBV"] = obv(df)
-
-        if not rising(
-            df["RSI"],
-            6
-        ):
-            return None
-
-        obv_yes = rising(
-            df["OBV"],
-            6
-        )
-
-        price = float(
-            df["close"].iloc[-1]
-        )
-
-        sma = sma20(df)
-
-        return {
-            "Stock": stock,
-            "Price": round(
-                price,
-                2
-            ),
-            "20 SMA": (
-                round(
-                    sma,
-                    2
-                )
-                if sma is not None
-                else None
-            ),
-            "20 SMA Within 1%":
-                sma20_within_1_percent(
-                    price,
-                    sma
-                ),
-            "RSI": round(
-                float(
-                    df["RSI"].iloc[-1]
-                ),
-                2
-            ),
-            "RSI Rising": "YES",
-            "OBV Rising":
-                "YES"
-                if obv_yes
-                else "NO",
-            "RSI Before Sideways":
-                rsi_before_sideways(
-                    df
-                ),
-            "Price Phase":
-                "Fall → Sideways"
-        }
-
-    with ThreadPoolExecutor(
-        max_workers=8
-    ) as executor:
-
-        futures = [
-            executor.submit(
-                worker,
-                stock
-            )
-            for stock in NIFTY_50
-        ]
-
-        for future in as_completed(
-            futures
-        ):
-
-            try:
-
-                result = future.result()
-
-                if result:
-                    rows.append(result)
+                    if not token:
+                        continue
+
+                    depth = item.get(
+                        "depth",
+                        {}
+                    )
+
+                    buy = (
+                        depth.get(
+                            "buy",
+                            []
+                        )
+                        if isinstance(
+                            depth,
+                            dict
+                        )
+                        else []
+                    )
+
+                    sell = (
+                        depth.get(
+                            "sell",
+                            []
+                        )
+                        if isinstance(
+                            depth,
+                            dict
+                        )
+                        else []
+                    )
+
+                    bid = None
+                    ask = None
+
+                    if buy:
+                        try:
+                            bid = float(
+                                buy[0].get(
+                                    "price"
+                                )
+                            )
+                        except Exception:
+                            pass
+
+                    if sell:
+                        try:
+                            ask = float(
+                                sell[0].get(
+                                    "price"
+                                )
+                            )
+                        except Exception:
+                            pass
+
+                    try:
+                        ltp = float(
+                            item.get("ltp")
+                        )
+                    except Exception:
+                        ltp = None
+
+                    result[token] = {
+                        "ltp": ltp,
+                        "bid": bid,
+                        "ask": ask,
+                        "symbol": item.get(
+                            "tradingSymbol",
+                            ""
+                        )
+                    }
 
             except Exception:
-                pass
+                continue
 
-    result = pd.DataFrame(
-        rows
-    )
-
-    if not result.empty:
-
-        result.insert(
-            0,
-            "Rank",
-            range(
-                1,
-                len(result) + 1
-            )
-        )
+            if (
+                i + QUOTE_BATCH_SIZE
+                < len(tokens)
+            ):
+                time.sleep(
+                    QUOTE_SLEEP
+                )
 
     return result
 
 
 # ============================================================
-# CURRENT MONTH EXPIRY
+# EXPIRY
 # ============================================================
 
-def current_month_expiry(
+def nearest_expiry_for_instrument(
     master,
-    exchange="NFO"
+    instrument,
+    name
 ):
 
     today = pd.Timestamp(
@@ -1028,38 +516,21 @@ def current_month_expiry(
     )
 
     x = master[
-        (master["exchange"] == exchange)
+        (master["exchange"] == "NFO")
+        &
+        (master["instrument"] == instrument)
+        &
+        (master["name"] == name)
         &
         master["expiry_date"].notna()
         &
         (
-            master["expiry_date"]
-            >= today
-        )
-    ].copy()
-
-    if x.empty:
-        return None
-
-    same_month = x[
-        (
-            x["expiry_date"].dt.month
-            ==
-            today.month
-        )
-        &
-        (
-            x["expiry_date"].dt.year
-            ==
-            today.year
+            master["expiry_date"] >= today
         )
     ]
 
-    if not same_month.empty:
-
-        return same_month[
-            "expiry_date"
-        ].min()
+    if x.empty:
+        return None
 
     return x[
         "expiry_date"
@@ -1067,10 +538,45 @@ def current_month_expiry(
 
 
 # ============================================================
-# FUTURE MAP
+# STOCK EXPIRY
 # ============================================================
 
-def stock_future_map(
+def stock_expiry(
+    master
+):
+
+    today = pd.Timestamp(
+        now_ist().date()
+    )
+
+    x = master[
+        (master["exchange"] == "NFO")
+        &
+        (
+            master["instrument"] == "FUTSTK"
+        )
+        &
+        master["expiry_date"].notna()
+        &
+        (
+            master["expiry_date"] >= today
+        )
+    ]
+
+    if x.empty:
+        return None
+
+    # nearest common stock expiry
+    return x[
+        "expiry_date"
+    ].min()
+
+
+# ============================================================
+# ALL FNO STOCK FUTURES
+# ============================================================
+
+def all_fno_futures(
     master,
     expiry
 ):
@@ -1078,13 +584,16 @@ def stock_future_map(
     x = master[
         (master["exchange"] == "NFO")
         &
-        (master["instrument"] == "FUTSTK")
+        (
+            master["instrument"]
+            == "FUTSTK"
+        )
         &
         (
             master["expiry_date"]
             == expiry
         )
-    ]
+    ].copy()
 
     result = {}
 
@@ -1092,7 +601,7 @@ def stock_future_map(
 
         stock = str(
             row["name"]
-        ).strip()
+        ).strip().upper()
 
         if stock:
             result[stock] = row
@@ -1101,247 +610,30 @@ def stock_future_map(
 
 
 # ============================================================
-# ALL F&O STOCKS
+# OPTIONS MAP
 # ============================================================
 
-def all_fno_stocks(
+def option_maps(
     master,
-    expiry
-):
-
-    futures = master[
-        (master["exchange"] == "NFO")
-        &
-        (master["instrument"] == "FUTSTK")
-        &
-        (
-            master["expiry_date"]
-            == expiry
-        )
-    ]
-
-    options = master[
-        (master["exchange"] == "NFO")
-        &
-        (master["instrument"] == "OPTSTK")
-        &
-        (
-            master["expiry_date"]
-            == expiry
-        )
-    ]
-
-    future_names = set(
-        futures["name"]
-        .dropna()
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
-
-    option_names = set(
-        options["name"]
-        .dropna()
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
-
-    return sorted(
-        future_names
-        .intersection(
-            option_names
-        )
-    )
-
-
-# ============================================================
-# FUTURE > SPOT
-# ============================================================
-
-def scan_future_spot(
-    jwt,
-    master
-):
-
-    expiry = current_month_expiry(
-        master,
-        "NFO"
-    )
-
-    if expiry is None:
-        return pd.DataFrame()
-
-    spot_map = cash_token_map(
-        master
-    )
-
-    fmap = stock_future_map(
-        master,
-        expiry
-    )
-
-    stocks = [
-        stock
-        for stock in NIFTY_50
-        if (
-            stock in spot_map
-            and stock in fmap
-        )
-    ]
-
-    spot_tokens = [
-        spot_map[stock]["token"]
-        for stock in stocks
-    ]
-
-    future_tokens = [
-        str(
-            fmap[stock]["token"]
-        )
-        for stock in stocks
-    ]
-
-    spot_quotes = batch_full_quotes(
-        jwt,
-        "NSE",
-        spot_tokens
-    )
-
-    future_quotes = batch_full_quotes(
-        jwt,
-        "NFO",
-        future_tokens
-    )
-
-    rows = []
-
-    for stock in stocks:
-
-        spot_data = spot_quotes.get(
-            spot_map[stock]["token"]
-        )
-
-        future_data = future_quotes.get(
-            str(
-                fmap[stock]["token"]
-            )
-        )
-
-        if not spot_data or not future_data:
-            continue
-
-        spot = spot_data.get(
-            "ltp"
-        )
-
-        future = future_data.get(
-            "ltp"
-        )
-
-        if spot is None or future is None:
-            continue
-
-        difference = (
-            future - spot
-        )
-
-        if difference <= 0:
-            continue
-
-        lot = int(
-            fmap[stock]["lot_size"]
-        )
-
-        profit = (
-            difference * lot
-        )
-
-        rows.append({
-
-            "Stock": stock,
-
-            "Spot": round(
-                spot,
-                2
-            ),
-
-            "Future": round(
-                future,
-                2
-            ),
-
-            "Future > Spot":
-                "YES",
-
-            "Difference":
-                round(
-                    difference,
-                    2
-                ),
-
-            "Lot Size":
-                lot,
-
-            "Difference × Lot":
-                round(
-                    profit,
-                    2
-                ),
-
-            "Expiry":
-                expiry.strftime(
-                    "%d-%b-%Y"
-                )
-        })
-
-    result = pd.DataFrame(
-        rows
-    )
-
-    if not result.empty:
-
-        result = (
-            result
-            .sort_values(
-                "Difference × Lot",
-                ascending=False
-            )
-            .reset_index(drop=True)
-        )
-
-        result.insert(
-            0,
-            "Rank",
-            range(
-                1,
-                len(result) + 1
-            )
-        )
-
-    return result
-
-
-# ============================================================
-# STOCK OPTION MAP
-# ============================================================
-
-def stock_option_map(
-    master,
-    stock,
-    expiry
+    expiry,
+    stocks
 ):
 
     x = master[
         (master["exchange"] == "NFO")
         &
-        (master["instrument"] == "OPTSTK")
-        &
-        (master["name"] == stock)
+        (
+            master["instrument"]
+            == "OPTSTK"
+        )
         &
         (
             master["expiry_date"]
             == expiry
+        )
+        &
+        (
+            master["name"].isin(stocks)
         )
     ]
 
@@ -1349,799 +641,588 @@ def stock_option_map(
 
     for _, row in x.iterrows():
 
-        strike = row["strike_num"]
+        stock = str(
+            row["name"]
+        ).strip().upper()
+
+        strike = row[
+            "strike_num"
+        ]
 
         if pd.isna(strike):
             continue
-
-        strike = round(
-            float(strike),
-            2
-        )
 
         symbol = str(
             row["symbol"]
         )
 
         if symbol.endswith("CE"):
-            option_type = "CE"
+            typ = "CE"
 
         elif symbol.endswith("PE"):
-            option_type = "PE"
+            typ = "PE"
 
         else:
             continue
 
-        result[
+        result.setdefault(
+            stock,
+            {}
+        )[
             (
-                strike,
-                option_type
+                round(
+                    float(strike),
+                    2
+                ),
+                typ
             )
-        ] = {
-            "token":
-                str(row["token"]),
-
-            "symbol":
-                symbol
-        }
+        ] = row
 
     return result
 
 
 # ============================================================
-# ESTIMATED MARGIN
+# SELECT NEAREST STRIKES
 # ============================================================
 
-def estimated_margin(
-    future_price,
-    lot_size
+def nearest_strikes(
+    omap,
+    future,
+    count=12
 ):
 
-    if future_price is None:
-        return 0
-
-    if lot_size <= 0:
-        return 0
-
-    contract_value = (
-        future_price
-        *
-        lot_size
+    strikes = sorted(
+        set(
+            strike
+            for strike, typ
+            in omap.keys()
+        )
     )
 
-    # Conservative estimate.
-    # Actual SPAN + exposure margin may differ.
-    return (
-        contract_value
-        *
-        0.18
-    )
-
-
-# ============================================================
-# PARITY CALCULATION
-# ============================================================
-
-def calculate_parity(
-    stock,
-    expiry,
-    strike,
-    ce_data,
-    pe_data,
-    future_data,
-    lot_size
-):
-
-    ce_bid = ce_data.get(
-        "bid"
-    )
-
-    ce_ask = ce_data.get(
-        "ask"
-    )
-
-    pe_bid = pe_data.get(
-        "bid"
-    )
-
-    pe_ask = pe_data.get(
-        "ask"
-    )
-
-    future_bid = future_data.get(
-        "bid"
-    )
-
-    future_ask = future_data.get(
-        "ask"
-    )
-
-    values = [
-        ce_bid,
-        ce_ask,
-        pe_bid,
-        pe_ask,
-        future_bid,
-        future_ask
-    ]
-
-    # No executable quote
-    if any(
-        value is None
-        or value <= 0
-        for value in values
-    ):
+    if not strikes:
         return []
 
-    rows = []
-
-    # ========================================================
-    # DIRECTION 1
-    #
-    # BUY CE @ ASK
-    # SELL PE @ BID
-    # SELL FUTURE @ BID
-    #
-    # Profit =
-    # (Future Bid - Strike)
-    # -
-    # (CE Ask - PE Bid)
-    # ========================================================
-
-    synthetic_buy = (
-        ce_ask
-        -
-        pe_bid
+    center = min(
+        range(len(strikes)),
+        key=lambda i:
+            abs(
+                strikes[i]
+                - future
+            )
     )
 
-    future_sell_value = (
-        future_bid
-        -
-        strike
+    start = max(
+        0,
+        center - count
     )
 
-    edge_buy = (
-        future_sell_value
-        -
-        synthetic_buy
+    end = min(
+        len(strikes),
+        center + count + 1
     )
 
-    if edge_buy >= MIN_EDGE:
-
-        edge_lot = (
-            edge_buy
-            *
-            lot_size
-        )
-
-        margin = estimated_margin(
-            future_bid,
-            lot_size
-        )
-
-        edge_margin = (
-            edge_lot
-            /
-            margin
-            *
-            100
-            if margin > 0
-            else 0
-        )
-
-        rows.append({
-
-            "Stock":
-                stock,
-
-            "Direction":
-                "BUY SYNTHETIC",
-
-            "Expiry":
-                expiry.strftime(
-                    "%d-%b-%Y"
-                ),
-
-            "Strike":
-                round(
-                    strike,
-                    2
-                ),
-
-            "CE Bid":
-                round(
-                    ce_bid,
-                    2
-                ),
-
-            "CE Ask":
-                round(
-                    ce_ask,
-                    2
-                ),
-
-            "PE Bid":
-                round(
-                    pe_bid,
-                    2
-                ),
-
-            "PE Ask":
-                round(
-                    pe_ask,
-                    2
-                ),
-
-            "Future Bid":
-                round(
-                    future_bid,
-                    2
-                ),
-
-            "Future Ask":
-                round(
-                    future_ask,
-                    2
-                ),
-
-            "Synthetic":
-                round(
-                    synthetic_buy,
-                    2
-                ),
-
-            "Future − Strike":
-                round(
-                    future_sell_value,
-                    2
-                ),
-
-            "Edge/Unit":
-                round(
-                    edge_buy,
-                    2
-                ),
-
-            "Lot Size":
-                int(lot_size),
-
-            "Edge × Lot":
-                round(
-                    edge_lot,
-                    2
-                ),
-
-            "Est. Margin":
-                round(
-                    margin,
-                    2
-                ),
-
-            "Edge/Margin %":
-                round(
-                    edge_margin,
-                    3
-                )
-        })
-
-    # ========================================================
-    # DIRECTION 2
-    #
-    # SELL CE @ BID
-    # BUY PE @ ASK
-    # BUY FUTURE @ ASK
-    #
-    # Profit =
-    # (CE Bid - PE Ask)
-    # -
-    # (Future Ask - Strike)
-    # ========================================================
-
-    synthetic_sell = (
-        ce_bid
-        -
-        pe_ask
-    )
-
-    future_buy_value = (
-        future_ask
-        -
-        strike
-    )
-
-    edge_sell = (
-        synthetic_sell
-        -
-        future_buy_value
-    )
-
-    if edge_sell >= MIN_EDGE:
-
-        edge_lot = (
-            edge_sell
-            *
-            lot_size
-        )
-
-        margin = estimated_margin(
-            future_ask,
-            lot_size
-        )
-
-        edge_margin = (
-            edge_lot
-            /
-            margin
-            *
-            100
-            if margin > 0
-            else 0
-        )
-
-        rows.append({
-
-            "Stock":
-                stock,
-
-            "Direction":
-                "SELL SYNTHETIC",
-
-            "Expiry":
-                expiry.strftime(
-                    "%d-%b-%Y"
-                ),
-
-            "Strike":
-                round(
-                    strike,
-                    2
-                ),
-
-            "CE Bid":
-                round(
-                    ce_bid,
-                    2
-                ),
-
-            "CE Ask":
-                round(
-                    ce_ask,
-                    2
-                ),
-
-            "PE Bid":
-                round(
-                    pe_bid,
-                    2
-                ),
-
-            "PE Ask":
-                round(
-                    pe_ask,
-                    2
-                ),
-
-            "Future Bid":
-                round(
-                    future_bid,
-                    2
-                ),
-
-            "Future Ask":
-                round(
-                    future_ask,
-                    2
-                ),
-
-            "Synthetic":
-                round(
-                    synthetic_sell,
-                    2
-                ),
-
-            "Future − Strike":
-                round(
-                    future_buy_value,
-                    2
-                ),
-
-            "Edge/Unit":
-                round(
-                    edge_sell,
-                    2
-                ),
-
-            "Lot Size":
-                int(lot_size),
-
-            "Edge × Lot":
-                round(
-                    edge_lot,
-                    2
-                ),
-
-            "Est. Margin":
-                round(
-                    margin,
-                    2
-                ),
-
-            "Edge/Margin %":
-                round(
-                    edge_margin,
-                    3
-                )
-        })
-
-    return rows
+    return strikes[
+        start:end
+    ]
 
 
 # ============================================================
-# ALL F&O STOCK PARITY SCANNER
+# EXECUTABLE PARITY CALCULATION
 # ============================================================
 
-def scan_all_fno_stock_parity(
-    jwt,
-    master
+def calculate_two_direction(
+    future_bid,
+    future_ask,
+    ce_bid,
+    ce_ask,
+    pe_bid,
+    pe_ask,
+    strike
 ):
 
-    expiry = current_month_expiry(
-        master,
-        "NFO"
+    # Direction 1:
+    #
+    # BUY CE at ASK
+    # SELL PE at BID
+    # SELL FUTURE at BID
+    #
+    # Edge =
+    # Future Bid - CE Ask + PE Bid - Strike
+
+    d1 = (
+        future_bid
+        - ce_ask
+        + pe_bid
+        - strike
+    )
+
+    # Direction 2:
+    #
+    # SELL CE at BID
+    # BUY PE at ASK
+    # BUY FUTURE at ASK
+    #
+    # Edge =
+    # CE Bid - PE Ask - Future Ask + Strike
+
+    d2 = (
+        ce_bid
+        - pe_ask
+        - future_ask
+        + strike
+    )
+
+    return d1, d2
+
+
+# ============================================================
+# STOCK PARITY SCAN
+# ============================================================
+
+def scan_stock_group(
+    jwt,
+    master,
+    stocks
+):
+
+    expiry = stock_expiry(
+        master
     )
 
     if expiry is None:
         return pd.DataFrame()
 
-    # --------------------------------------------------------
-    # ALL STOCK FUTURES
-    # --------------------------------------------------------
-
-    future_df = master[
-        (master["exchange"] == "NFO")
-        &
-        (master["instrument"] == "FUTSTK")
-        &
-        (
-            master["expiry_date"]
-            == expiry
-        )
-    ].copy()
-
-    # --------------------------------------------------------
-    # ALL STOCK OPTIONS
-    # --------------------------------------------------------
-
-    option_df = master[
-        (master["exchange"] == "NFO")
-        &
-        (master["instrument"] == "OPTSTK")
-        &
-        (
-            master["expiry_date"]
-            == expiry
-        )
-    ].copy()
-
-    if future_df.empty or option_df.empty:
-        return pd.DataFrame()
-
-    future_names = set(
-        future_df["name"]
-        .dropna()
-        .astype(str)
-        .str.upper()
-        .str.strip()
+    futures = all_fno_futures(
+        master,
+        expiry
     )
 
-    option_names = set(
-        option_df["name"]
-        .dropna()
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
-
-    stocks = sorted(
-        future_names
-        &
-        option_names
-    )
+    stocks = [
+        s
+        for s in stocks
+        if s in futures
+    ]
 
     if not stocks:
         return pd.DataFrame()
 
-    # --------------------------------------------------------
-    # FUTURE MAP
-    # --------------------------------------------------------
+    omaps = option_maps(
+        master,
+        expiry,
+        stocks
+    )
 
-    future_map = {}
+    exchange_tokens = {
+        "NFO": []
+    }
 
-    for _, row in future_df.iterrows():
-
-        stock = str(
-            row["name"]
-        ).strip()
-
-        if not stock:
-            continue
-
-        future_map[stock] = {
-            "token":
-                str(row["token"]),
-
-            "lot_size":
-                int(row["lot_size"])
-                if not pd.isna(
-                    row["lot_size"]
-                )
-                else 1
-        }
-
-    # --------------------------------------------------------
-    # OPTION MAP
-    # --------------------------------------------------------
-
-    option_maps = {}
+    future_rows = {}
 
     for stock in stocks:
 
-        x = option_df[
-            option_df["name"]
-            == stock
-        ]
+        fr = futures[stock]
 
-        contract_map = {}
+        future_rows[
+            stock
+        ] = fr
 
-        for _, row in x.iterrows():
-
-            strike = row["strike_num"]
-
-            if pd.isna(strike):
-                continue
-
-            strike = round(
-                float(strike),
-                2
+        exchange_tokens[
+            "NFO"
+        ].append(
+            str(
+                fr["token"]
             )
+        )
 
-            symbol = str(
-                row["symbol"]
-            )
-
-            if symbol.endswith("CE"):
-                option_type = "CE"
-
-            elif symbol.endswith("PE"):
-                option_type = "PE"
-
-            else:
-                continue
-
-            contract_map[
-                (
-                    strike,
-                    option_type
-                )
-            ] = {
-                "token":
-                    str(row["token"]),
-
-                "symbol":
-                    symbol
-            }
-
-        if contract_map:
-            option_maps[stock] = (
-                contract_map
-            )
-
-    # --------------------------------------------------------
-    # FIRST: ALL FUTURES QUOTES
-    # --------------------------------------------------------
-
-    future_tokens = [
-        future_map[stock]["token"]
-        for stock in stocks
-        if stock in future_map
-        and stock in option_maps
-    ]
-
-    future_quotes = batch_full_quotes(
+    # पहले futures quote
+    future_quotes = full_quote_batch(
         jwt,
-        "NFO",
-        future_tokens
+        exchange_tokens
     )
 
     # --------------------------------------------------------
-    # SELECT ATM ±10
+    # अब केवल nearest strikes के option tokens
     # --------------------------------------------------------
+
+    exchange_tokens = {
+        "NFO": []
+    }
 
     selected = {}
 
-    option_tokens = []
-
     for stock in stocks:
 
-        if stock not in future_map:
-            continue
-
-        if stock not in option_maps:
-            continue
-
-        future_token = (
-            future_map[stock]["token"]
-        )
-
-        future_data = future_quotes.get(
-            future_token
-        )
-
-        if not future_data:
-            continue
-
-        future_ltp = future_data.get(
-            "ltp"
-        )
-
-        if future_ltp is None:
-            continue
-
-        contracts = option_maps[
-            stock
-        ]
-
-        strikes = sorted(
-            set(
-                strike
-                for strike, option_type
-                in contracts.keys()
+        fq = future_quotes.get(
+            str(
+                future_rows[stock]["token"]
             )
         )
 
-        if not strikes:
+        if not fq:
             continue
 
-        # Nearest ATM strike
-        atm_index = min(
-            range(len(strikes)),
-            key=lambda i:
-                abs(
-                    strikes[i]
-                    -
-                    future_ltp
+        future = fq.get(
+            "ltp"
+        )
+
+        if future is None:
+            continue
+
+        omap = omaps.get(
+            stock,
+            {}
+        )
+
+        strikes = nearest_strikes(
+            omap,
+            future,
+            STRIKES_EACH_SIDE
+        )
+
+        selected[
+            stock
+        ] = strikes
+
+        for strike in strikes:
+
+            for typ in [
+                "CE",
+                "PE"
+            ]:
+
+                row = omap.get(
+                    (
+                        strike,
+                        typ
+                    )
                 )
-        )
 
-        start = max(
-            0,
-            atm_index
-            -
-            STRIKES_EACH_SIDE
-        )
+                if row is not None:
 
-        end = min(
-            len(strikes),
-            atm_index
-            +
-            STRIKES_EACH_SIDE
-            +
-            1
-        )
+                    exchange_tokens[
+                        "NFO"
+                    ].append(
+                        str(
+                            row["token"]
+                        )
+                    )
 
-        selected_strikes = strikes[
-            start:end
+    option_quotes = full_quote_batch(
+        jwt,
+        exchange_tokens
+    )
+
+    rows = []
+
+    for stock in stocks:
+
+        fr = future_rows[
+            stock
         ]
 
-        selected_contracts = []
+        future_token = str(
+            fr["token"]
+        )
 
-        for strike in selected_strikes:
+        fq = future_quotes.get(
+            future_token
+        )
 
-            ce = contracts.get(
+        if not fq:
+            continue
+
+        future = fq.get(
+            "ltp"
+        )
+
+        future_bid = fq.get(
+            "bid"
+        )
+
+        future_ask = fq.get(
+            "ask"
+        )
+
+        if None in (
+            future,
+            future_bid,
+            future_ask
+        ):
+            continue
+
+        omap = omaps.get(
+            stock,
+            {}
+        )
+
+        lot = int(
+            fr["lot_size"]
+        )
+
+        for strike in selected.get(
+            stock,
+            []
+        ):
+
+            ce = omap.get(
                 (
                     strike,
                     "CE"
                 )
             )
 
-            pe = contracts.get(
+            pe = omap.get(
                 (
                     strike,
                     "PE"
                 )
             )
 
-            # दोनों CE + PE जरूरी
             if ce is None or pe is None:
                 continue
 
-            selected_contracts.append(
-                (
-                    strike,
-                    ce,
-                    pe
+            ceq = option_quotes.get(
+                str(
+                    ce["token"]
                 )
             )
 
-            option_tokens.append(
-                ce["token"]
+            peq = option_quotes.get(
+                str(
+                    pe["token"]
+                )
             )
 
-            option_tokens.append(
-                pe["token"]
-            )
-
-        if selected_contracts:
-
-            selected[stock] = {
-                "future":
-                    future_data,
-
-                "lot_size":
-                    future_map[
-                        stock
-                    ]["lot_size"],
-
-                "contracts":
-                    selected_contracts
-            }
-
-    # --------------------------------------------------------
-    # SECOND: ALL OPTIONS IN BATCH
-    # --------------------------------------------------------
-
-    option_quotes = batch_full_quotes(
-        jwt,
-        "NFO",
-        option_tokens
-    )
-
-    # --------------------------------------------------------
-    # CALCULATE BOTH DIRECTIONS
-    # --------------------------------------------------------
-
-    rows = []
-
-    for stock, data in selected.items():
-
-        future_data = data[
-            "future"
-        ]
-
-        lot_size = data[
-            "lot_size"
-        ]
-
-        for (
-            strike,
-            ce,
-            pe
-        ) in data["contracts"]:
-
-            ce_data = option_quotes.get(
-                ce["token"]
-            )
-
-            pe_data = option_quotes.get(
-                pe["token"]
-            )
-
-            if not ce_data or not pe_data:
+            if not ceq or not peq:
                 continue
 
-            result_rows = calculate_parity(
-                stock,
-                expiry,
-                strike,
-                ce_data,
-                pe_data,
-                future_data,
-                lot_size
+            ce_bid = ceq.get(
+                "bid"
             )
 
-            rows.extend(
-                result_rows
+            ce_ask = ceq.get(
+                "ask"
             )
+
+            pe_bid = peq.get(
+                "bid"
+            )
+
+            pe_ask = peq.get(
+                "ask"
+            )
+
+            if None in (
+                ce_bid,
+                ce_ask,
+                pe_bid,
+                pe_ask
+            ):
+                continue
+
+            d1, d2 = calculate_two_direction(
+                future_bid,
+                future_ask,
+                ce_bid,
+                ce_ask,
+                pe_bid,
+                pe_ask,
+                strike
+            )
+
+            # =================================================
+            # DIRECTION 1
+            # =================================================
+
+            if d1 >= MIN_EDGE:
+
+                rows.append({
+
+                    "Stock": stock,
+
+                    "Direction":
+                        "BUY SYNTHETIC + SELL FUTURE",
+
+                    "Expiry":
+                        expiry.strftime(
+                            "%d-%b-%Y"
+                        ),
+
+                    "Future":
+                        round(
+                            future,
+                            2
+                        ),
+
+                    "Future Bid":
+                        round(
+                            future_bid,
+                            2
+                        ),
+
+                    "Future Ask":
+                        round(
+                            future_ask,
+                            2
+                        ),
+
+                    "Strike":
+                        round(
+                            strike,
+                            2
+                        ),
+
+                    "CE Bid":
+                        round(
+                            ce_bid,
+                            2
+                        ),
+
+                    "CE Ask":
+                        round(
+                            ce_ask,
+                            2
+                        ),
+
+                    "PE Bid":
+                        round(
+                            pe_bid,
+                            2
+                        ),
+
+                    "PE Ask":
+                        round(
+                            pe_ask,
+                            2
+                        ),
+
+                    "Edge/Unit":
+                        round(
+                            d1,
+                            2
+                        ),
+
+                    "Edge × Lot":
+                        round(
+                            d1 * lot,
+                            2
+                        ),
+
+                    "Lot Size":
+                        lot,
+
+                    "Margin":
+                        None,
+
+                    "ROM %":
+                        None,
+
+                    "CE Symbol":
+                        ce["symbol"],
+
+                    "PE Symbol":
+                        pe["symbol"],
+
+                    "Future Symbol":
+                        fr["symbol"]
+                })
+
+            # =================================================
+            # DIRECTION 2
+            # =================================================
+
+            if d2 >= MIN_EDGE:
+
+                rows.append({
+
+                    "Stock": stock,
+
+                    "Direction":
+                        "SELL SYNTHETIC + BUY FUTURE",
+
+                    "Expiry":
+                        expiry.strftime(
+                            "%d-%b-%Y"
+                        ),
+
+                    "Future":
+                        round(
+                            future,
+                            2
+                        ),
+
+                    "Future Bid":
+                        round(
+                            future_bid,
+                            2
+                        ),
+
+                    "Future Ask":
+                        round(
+                            future_ask,
+                            2
+                        ),
+
+                    "Strike":
+                        round(
+                            strike,
+                            2
+                        ),
+
+                    "CE Bid":
+                        round(
+                            ce_bid,
+                            2
+                        ),
+
+                    "CE Ask":
+                        round(
+                            ce_ask,
+                            2
+                        ),
+
+                    "PE Bid":
+                        round(
+                            pe_bid,
+                            2
+                        ),
+
+                    "PE Ask":
+                        round(
+                            pe_ask,
+                            2
+                        ),
+
+                    "Edge/Unit":
+                        round(
+                            d2,
+                            2
+                        ),
+
+                    "Edge × Lot":
+                        round(
+                            d2 * lot,
+                            2
+                        ),
+
+                    "Lot Size":
+                        lot,
+
+                    "Margin":
+                        None,
+
+                    "ROM %":
+                        None,
+
+                    "CE Symbol":
+                        ce["symbol"],
+
+                    "PE Symbol":
+                        pe["symbol"],
+
+                    "Future Symbol":
+                        fr["symbol"]
+                })
 
     result = pd.DataFrame(
         rows
@@ -2150,49 +1231,78 @@ def scan_all_fno_stock_parity(
     if result.empty:
         return result
 
-    # --------------------------------------------------------
-    # SORT BEST OPPORTUNITIES FIRST
-    # --------------------------------------------------------
-
-    result = (
-        result
-        .sort_values(
-            [
-                "Edge/Margin %",
-                "Edge × Lot"
-            ],
-            ascending=False
-        )
-        .reset_index(
-            drop=True
-        )
+    return result.sort_values(
+        "Edge × Lot",
+        ascending=False
+    ).reset_index(
+        drop=True
     )
-
-    result.insert(
-        0,
-        "Rank",
-        range(
-            1,
-            len(result) + 1
-        )
-    )
-
-    return result
 
 
 # ============================================================
-# INDEX PARITY
+# INDEX SCANNER
 # ============================================================
 
-def scan_index_parity(
-    jwt,
+def find_index_name(
     master,
-    index_name
+    label
 ):
 
-    expiry = current_month_expiry(
+    names = {
+        "NIFTY": [
+            "NIFTY"
+        ],
+
+        "BANKNIFTY": [
+            "BANKNIFTY"
+        ],
+
+        "SENSEX": [
+            "SENSEX"
+        ]
+    }
+
+    for name in names.get(
+        label,
+        []
+    ):
+
+        if (
+            (
+                master["name"]
+                == name
+            )
+            &
+            (
+                master["exchange"]
+                == "NFO"
+            )
+        ).any():
+
+            return name
+
+    return None
+
+
+def scan_index(
+    jwt,
+    master,
+    label
+):
+
+    name = find_index_name(
         master,
-        "NFO"
+        label
+    )
+
+    if name is None:
+        return pd.DataFrame()
+
+    # FUTURE expiry
+    expiry = nearest_expiry_for_instrument(
+        master,
+        "FUTIDX",
+        name
     )
 
     if expiry is None:
@@ -2201,132 +1311,107 @@ def scan_index_parity(
     x = master[
         (master["exchange"] == "NFO")
         &
-        (master["name"] == index_name)
+        (master["name"] == name)
         &
         (
             master["expiry_date"]
             == expiry
         )
-    ].copy()
-
-    if x.empty:
-        return pd.DataFrame()
+    ]
 
     futures = x[
         x["instrument"]
         == "FUTIDX"
     ]
 
-    if futures.empty:
-        return pd.DataFrame()
-
-    future_row = futures.iloc[0]
-
-    future_token = str(
-        future_row["token"]
-    )
-
-    future_quotes = batch_full_quotes(
-        jwt,
-        "NFO",
-        [future_token]
-    )
-
-    future_data = future_quotes.get(
-        future_token
-    )
-
-    if not future_data:
-        return pd.DataFrame()
-
-    future_ltp = future_data.get(
-        "ltp"
-    )
-
-    if future_ltp is None:
-        return pd.DataFrame()
-
     options = x[
         x["instrument"]
         == "OPTIDX"
-    ].copy()
-
-    options = options[
-        options["symbol"].str.endswith(
-            (
-                "CE",
-                "PE"
-            )
-        )
     ]
+
+    if futures.empty or options.empty:
+        return pd.DataFrame()
+
+    fr = futures.iloc[0]
+
+    future_token = str(
+        fr["token"]
+    )
+
+    fq = full_quote_batch(
+        jwt,
+        {
+            "NFO": [
+                future_token
+            ]
+        }
+    )
+
+    future_q = fq.get(
+        future_token
+    )
+
+    if not future_q:
+        return pd.DataFrame()
+
+    future = future_q.get(
+        "ltp"
+    )
+
+    future_bid = future_q.get(
+        "bid"
+    )
+
+    future_ask = future_q.get(
+        "ask"
+    )
+
+    if None in (
+        future,
+        future_bid,
+        future_ask
+    ):
+        return pd.DataFrame()
 
     strikes = sorted(
         set(
-            options["strike_num"]
+            options[
+                "strike_num"
+            ]
             .dropna()
             .astype(float)
         )
     )
 
-    if not strikes:
-        return pd.DataFrame()
-
-    atm_index = min(
-        range(len(strikes)),
-        key=lambda i:
+    strikes = sorted(
+        strikes,
+        key=lambda x:
             abs(
-                strikes[i]
-                -
-                future_ltp
+                x - future
             )
-    )
-
-    start = max(
-        0,
-        atm_index
-        -
-        STRIKES_EACH_SIDE
-    )
-
-    end = min(
-        len(strikes),
-        atm_index
-        +
-        STRIKES_EACH_SIDE
-        +
-        1
-    )
-
-    strikes = strikes[
-        start:end
+    )[
+        :STRIKES_EACH_SIDE * 2 + 1
     ]
 
     selected = options[
-        options["strike_num"].isin(
-            strikes
-        )
+        options[
+            "strike_num"
+        ].isin(strikes)
     ]
 
     tokens = (
-        selected["token"]
+        selected[
+            "token"
+        ]
         .astype(str)
         .tolist()
     )
 
-    option_quotes = batch_full_quotes(
+    quotes = full_quote_batch(
         jwt,
-        "NFO",
-        tokens
-    )
-
-    lot_size = (
-        int(
-            future_row["lot_size"]
-        )
-        if not pd.isna(
-            future_row["lot_size"]
-        )
-        else 1
+        {
+            "NFO": tokens
+        }
     )
 
     rows = []
@@ -2339,9 +1424,9 @@ def scan_index_parity(
                 == strike
             )
             &
-            selected["symbol"].str.endswith(
-                "CE"
-            )
+            selected[
+                "symbol"
+            ].str.endswith("CE")
         ]
 
         pe = selected[
@@ -2350,44 +1435,165 @@ def scan_index_parity(
                 == strike
             )
             &
-            selected["symbol"].str.endswith(
-                "PE"
-            )
+            selected[
+                "symbol"
+            ].str.endswith("PE")
         ]
 
         if ce.empty or pe.empty:
             continue
 
-        ce_token = str(
-            ce.iloc[0]["token"]
-        )
+        ce_row = ce.iloc[0]
+        pe_row = pe.iloc[0]
 
-        pe_token = str(
-            pe.iloc[0]["token"]
-        )
-
-        ce_data = option_quotes.get(
-            ce_token
-        )
-
-        pe_data = option_quotes.get(
-            pe_token
-        )
-
-        if not ce_data or not pe_data:
-            continue
-
-        rows.extend(
-            calculate_parity(
-                index_name,
-                expiry,
-                float(strike),
-                ce_data,
-                pe_data,
-                future_data,
-                lot_size
+        ce_q = quotes.get(
+            str(
+                ce_row["token"]
             )
         )
+
+        pe_q = quotes.get(
+            str(
+                pe_row["token"]
+            )
+        )
+
+        if not ce_q or not pe_q:
+            continue
+
+        ce_bid = ce_q.get("bid")
+        ce_ask = ce_q.get("ask")
+
+        pe_bid = pe_q.get("bid")
+        pe_ask = pe_q.get("ask")
+
+        if None in (
+            ce_bid,
+            ce_ask,
+            pe_bid,
+            pe_ask
+        ):
+            continue
+
+        d1, d2 = calculate_two_direction(
+            future_bid,
+            future_ask,
+            ce_bid,
+            ce_ask,
+            pe_bid,
+            pe_ask,
+            strike
+        )
+
+        for direction, edge in [
+            (
+                "BUY SYNTHETIC + SELL FUTURE",
+                d1
+            ),
+            (
+                "SELL SYNTHETIC + BUY FUTURE",
+                d2
+            )
+        ]:
+
+            if edge < MIN_EDGE:
+                continue
+
+            rows.append({
+
+                "Index": label,
+
+                "Direction":
+                    direction,
+
+                "Expiry":
+                    expiry.strftime(
+                        "%d-%b-%Y"
+                    ),
+
+                "Future":
+                    round(
+                        future,
+                        2
+                    ),
+
+                "Future Bid":
+                    round(
+                        future_bid,
+                        2
+                    ),
+
+                "Future Ask":
+                    round(
+                        future_ask,
+                        2
+                    ),
+
+                "Strike":
+                    round(
+                        strike,
+                        2
+                    ),
+
+                "CE Bid":
+                    round(
+                        ce_bid,
+                        2
+                    ),
+
+                "CE Ask":
+                    round(
+                        ce_ask,
+                        2
+                    ),
+
+                "PE Bid":
+                    round(
+                        pe_bid,
+                        2
+                    ),
+
+                "PE Ask":
+                    round(
+                        pe_ask,
+                        2
+                    ),
+
+                "Edge/Unit":
+                    round(
+                        edge,
+                        2
+                    ),
+
+                "Edge × Contract":
+                    round(
+                        edge
+                        * int(
+                            fr["lot_size"]
+                        ),
+                        2
+                    ),
+
+                "Lot Size":
+                    int(
+                        fr["lot_size"]
+                    ),
+
+                "Margin":
+                    None,
+
+                "ROM %":
+                    None,
+
+                "CE Symbol":
+                    ce_row["symbol"],
+
+                "PE Symbol":
+                    pe_row["symbol"],
+
+                "Future Symbol":
+                    fr["symbol"]
+            })
 
     result = pd.DataFrame(
         rows
@@ -2396,95 +1602,601 @@ def scan_index_parity(
     if result.empty:
         return result
 
-    result = (
-        result
-        .sort_values(
-            [
-                "Edge/Margin %",
-                "Edge × Lot"
-            ],
-            ascending=False
-        )
-        .reset_index(
-            drop=True
-        )
+    return result.sort_values(
+        "Edge × Contract",
+        ascending=False
+    ).reset_index(
+        drop=True
     )
 
-    result.insert(
-        0,
-        "Rank",
-        range(
-            1,
-            len(result) + 1
+
+# ============================================================
+# MARGIN
+# ============================================================
+
+def calculate_margin(
+    jwt,
+    row,
+    master
+):
+
+    try:
+
+        ce = master[
+            master["symbol"]
+            == row["CE Symbol"]
+        ]
+
+        pe = master[
+            master["symbol"]
+            == row["PE Symbol"]
+        ]
+
+        fut = master[
+            master["symbol"]
+            == row["Future Symbol"]
+        ]
+
+        if (
+            ce.empty
+            or pe.empty
+            or fut.empty
+        ):
+            return None
+
+        lot = int(
+            row["Lot Size"]
         )
+
+        direction = row[
+            "Direction"
+        ]
+
+        if (
+            direction
+            == "BUY SYNTHETIC + SELL FUTURE"
+        ):
+
+            positions = [
+
+                {
+                    "exchange": "NFO",
+                    "qty": lot,
+                    "price": row["CE Ask"],
+                    "productType": "INTRADAY",
+                    "token": str(
+                        ce.iloc[0]["token"]
+                    ),
+                    "tradeType": "BUY",
+                    "orderType": "LIMIT"
+                },
+
+                {
+                    "exchange": "NFO",
+                    "qty": lot,
+                    "price": row["PE Bid"],
+                    "productType": "INTRADAY",
+                    "token": str(
+                        pe.iloc[0]["token"]
+                    ),
+                    "tradeType": "SELL",
+                    "orderType": "LIMIT"
+                },
+
+                {
+                    "exchange": "NFO",
+                    "qty": lot,
+                    "price": row["Future Bid"],
+                    "productType": "INTRADAY",
+                    "token": str(
+                        fut.iloc[0]["token"]
+                    ),
+                    "tradeType": "SELL",
+                    "orderType": "LIMIT"
+                }
+            ]
+
+        else:
+
+            positions = [
+
+                {
+                    "exchange": "NFO",
+                    "qty": lot,
+                    "price": row["CE Bid"],
+                    "productType": "INTRADAY",
+                    "token": str(
+                        ce.iloc[0]["token"]
+                    ),
+                    "tradeType": "SELL",
+                    "orderType": "LIMIT"
+                },
+
+                {
+                    "exchange": "NFO",
+                    "qty": lot,
+                    "price": row["PE Ask"],
+                    "productType": "INTRADAY",
+                    "token": str(
+                        pe.iloc[0]["token"]
+                    ),
+                    "tradeType": "BUY",
+                    "orderType": "LIMIT"
+                },
+
+                {
+                    "exchange": "NFO",
+                    "qty": lot,
+                    "price": row["Future Ask"],
+                    "productType": "INTRADAY",
+                    "token": str(
+                        fut.iloc[0]["token"]
+                    ),
+                    "tradeType": "BUY",
+                    "orderType": "LIMIT"
+                }
+            ]
+
+        r = requests.post(
+            MARGIN_URL,
+            json={
+                "positions": positions
+            },
+            headers=auth_headers(jwt),
+            timeout=20
+        )
+
+        data = r.json()
+
+        if data.get("status") is not True:
+            return None
+
+        md = data.get(
+            "data",
+            {}
+        )
+
+        value = md.get(
+            "totalMarginRequired"
+        )
+
+        if value is None:
+            return None
+
+        return float(value)
+
+    except Exception:
+        return None
+
+
+def add_margins(
+    jwt,
+    result,
+    master,
+    max_rows=20
+):
+
+    if (
+        result is None
+        or result.empty
+    ):
+        return result
+
+    result = result.copy()
+
+    # केवल top opportunities पर margin
+    limit = min(
+        len(result),
+        max_rows
     )
+
+    margins = [
+        None
+        for _ in range(
+            len(result)
+        )
+    ]
+
+    for i in range(limit):
+
+        margin = calculate_margin(
+            jwt,
+            result.iloc[i],
+            master
+        )
+
+        margins[i] = margin
+
+        time.sleep(
+            0.12
+        )
+
+    result[
+        "Margin"
+    ] = margins
+
+    result[
+        "ROM %"
+    ] = np.where(
+        result["Margin"].notna()
+        &
+        (
+            result["Margin"]
+            > 0
+        ),
+
+        (
+            result["Edge × Lot"]
+            /
+            result["Margin"]
+        )
+        * 100,
+
+        np.nan
+    )
+
+    result[
+        "ROM %"
+    ] = result[
+        "ROM %"
+    ].round(2)
 
     return result
 
 
 # ============================================================
-# DISPLAY
+# HIGH EDGE ALERT
 # ============================================================
 
-def show_result(
-    result,
-    filename
+def generate_alerts(
+    result
 ):
 
     if (
         result is None
-        or
-        result.empty
+        or result.empty
     ):
+        return []
 
-        st.info(
-            "इस scan में कोई qualifying result नहीं मिला।"
+    alerts = []
+
+    for _, row in result.iterrows():
+
+        edge_lot = float(
+            row.get(
+                "Edge × Lot",
+                0
+            )
         )
 
+        rom = row.get(
+            "ROM %",
+            np.nan
+        )
+
+        high = (
+            edge_lot
+            >= HIGH_EDGE_LOT
+        )
+
+        if not pd.isna(rom):
+            high = (
+                high
+                or
+                float(rom)
+                >= HIGH_ROM
+            )
+
+        if not high:
+            continue
+
+        key = (
+            str(
+                row.get(
+                    "Stock",
+                    row.get(
+                        "Index",
+                        ""
+                    )
+                )
+            )
+            + "|"
+            + str(
+                row["Direction"]
+            )
+            + "|"
+            + str(
+                row["Strike"]
+            )
+            + "|"
+            + str(
+                row["Expiry"]
+            )
+        )
+
+        alerts.append(
+            (
+                key,
+                row.to_dict()
+            )
+        )
+
+    return alerts
+
+
+# ============================================================
+# BACKGROUND SCAN WORKER
+# ============================================================
+
+background_lock = threading.Lock()
+
+background_running = False
+
+
+def background_worker():
+
+    global background_running
+
+    if background_running:
         return
 
-    st.dataframe(
-        result,
-        use_container_width=True,
-        hide_index=True,
-        height=600
-    )
+    background_running = True
 
-    csv = result.to_csv(
-        index=False
-    ).encode(
-        "utf-8"
-    )
+    try:
 
-    st.download_button(
-        "⬇️ Download CSV",
-        data=csv,
-        file_name=filename,
-        mime="text/csv",
-        use_container_width=True
-    )
+        while True:
+
+            try:
+
+                master = prepare_master(
+                    download_master()
+                )
+
+                jwt = login()
+
+                # --------------------------------------------
+                # ALL FNO STOCKS
+                # --------------------------------------------
+
+                expiry = stock_expiry(
+                    master
+                )
+
+                if expiry is not None:
+
+                    futures = all_fno_futures(
+                        master,
+                        expiry
+                    )
+
+                    all_stocks = sorted(
+                        futures.keys()
+                    )
+
+                    # Two groups
+                    group_a = [
+                        s
+                        for s in all_stocks
+                        if s[0] <= "M"
+                    ]
+
+                    group_b = [
+                        s
+                        for s in all_stocks
+                        if s[0] > "M"
+                    ]
+
+                    results = []
+
+                    if group_a:
+
+                        a = scan_stock_group(
+                            jwt,
+                            master,
+                            group_a
+                        )
+
+                        if not a.empty:
+                            results.append(a)
+
+                    if group_b:
+
+                        b = scan_stock_group(
+                            jwt,
+                            master,
+                            group_b
+                        )
+
+                        if not b.empty:
+                            results.append(b)
+
+                    # ----------------------------------------
+                    # INDEXES
+                    # ----------------------------------------
+
+                    for index_name in [
+                        "NIFTY",
+                        "BANKNIFTY",
+                        "SENSEX"
+                    ]:
+
+                        try:
+
+                            idx = scan_index(
+                                jwt,
+                                master,
+                                index_name
+                            )
+
+                            if not idx.empty:
+
+                                results.append(
+                                    idx
+                                )
+
+                        except Exception:
+                            continue
+
+                    if results:
+
+                        combined = pd.concat(
+                            results,
+                            ignore_index=True
+                        )
+
+                        combined = combined.sort_values(
+                            "Edge × Lot"
+                            if
+                            "Edge × Lot"
+                            in combined.columns
+                            else "Edge × Contract",
+                            ascending=False
+                        ).reset_index(
+                            drop=True
+                        )
+
+                        # Margin only top opportunities
+                        combined = add_margins(
+                            jwt,
+                            combined,
+                            master,
+                            20
+                        )
+
+                    else:
+
+                        combined = pd.DataFrame()
+
+                    # ----------------------------------------
+                    # ALERTS
+                    # ----------------------------------------
+
+                    alerts = generate_alerts(
+                        combined
+                    )
+
+                    for key, data in alerts:
+
+                        # process-level alert memory
+                        if key not in ALERT_KEYS:
+
+                            ALERT_KEYS.add(
+                                key
+                            )
+
+                            ALERT_QUEUE.append(
+                                {
+                                    "time":
+                                        now_ist().strftime(
+                                            "%H:%M:%S"
+                                        ),
+                                    "data":
+                                        data
+                                }
+                            )
+
+                            # WhatsApp disabled until
+                            # credentials are supplied.
+                            if WHATSAPP_ENABLED:
+                                send_whatsapp_alert(
+                                    data
+                                )
+
+                    # ----------------------------------------
+                    # STORE
+                    # ----------------------------------------
+
+                    GLOBAL_RESULTS[
+                        "result"
+                    ] = combined
+
+                    GLOBAL_RESULTS[
+                        "last_scan"
+                    ] = now_ist().strftime(
+                        "%d-%m-%Y %H:%M:%S"
+                    )
+
+                    GLOBAL_RESULTS[
+                        "status"
+                    ] = "Running"
+
+                else:
+
+                    GLOBAL_RESULTS[
+                        "status"
+                    ] = "No F&O expiry found"
+
+            except Exception as e:
+
+                GLOBAL_RESULTS[
+                    "status"
+                ] = (
+                    "Error: "
+                    + str(e)
+                )
+
+            time.sleep(
+                BACKGROUND_SECONDS
+            )
+
+    finally:
+
+        background_running = False
 
 
 # ============================================================
-# LOAD MASTER + LOGIN
+# PROCESS LEVEL STORAGE
 # ============================================================
 
-try:
+if "global_initialized" not in st.session_state:
 
-    master = prepare_master(
-        download_master()
-    )
+    GLOBAL_RESULTS = {
+        "result": pd.DataFrame(),
+        "last_scan": "",
+        "status": "Stopped"
+    }
 
-    jwt = login()
+    ALERT_QUEUE = []
 
-except Exception as e:
+    ALERT_KEYS = set()
 
-    st.error(
-        "Connection/Login Error: "
-        + str(e)
-    )
+    st.session_state[
+        "global_initialized"
+    ] = True
 
-    st.stop()
+else:
+
+    if "GLOBAL_RESULTS" not in globals():
+
+        GLOBAL_RESULTS = {
+            "result": pd.DataFrame(),
+            "last_scan": "",
+            "status": "Stopped"
+        }
+
+    if "ALERT_QUEUE" not in globals():
+        ALERT_QUEUE = []
+
+    if "ALERT_KEYS" not in globals():
+        ALERT_KEYS = set()
+
+
+# ============================================================
+# WHATSAPP FUNCTION
+# ============================================================
+
+def send_whatsapp_alert(
+    data
+):
+
+    # --------------------------------------------------------
+    # अभी intentionally disabled
+    # --------------------------------------------------------
+    #
+    # Number/API credentials मिलने के बाद यहां
+    # WhatsApp provider API लगाई जाएगी.
+    #
+    return False
 
 
 # ============================================================
@@ -2492,423 +2204,705 @@ except Exception as e:
 # ============================================================
 
 st.sidebar.header(
-    "⚡ Scanner Settings"
+    "⚙️ Scanner Settings"
 )
 
-auto_update = st.sidebar.toggle(
-    "Auto Update",
-    value=False
+MIN_EDGE = st.sidebar.number_input(
+    "Minimum Edge / Unit",
+    min_value=0.0,
+    value=1.0,
+    step=0.5
 )
 
-refresh_seconds = st.sidebar.selectbox(
-    "Auto Update Interval",
-    [5, 10, 15, 30, 60],
-    index=1
+HIGH_EDGE_LOT = st.sidebar.number_input(
+    "High Edge × Lot Alert",
+    min_value=0.0,
+    value=5000.0,
+    step=1000.0
 )
 
-st.sidebar.caption(
-    "Auto Update सिर्फ Stock Parity "
-    "scanner को लगातार refresh करेगा।"
+HIGH_ROM = st.sidebar.number_input(
+    "High ROM % Alert",
+    min_value=0.0,
+    value=1.0,
+    step=0.25
 )
 
-min_edge_input = st.sidebar.number_input(
-    "Minimum Edge / Unit ₹",
-    min_value=0.05,
-    max_value=100.0,
-    value=0.50,
-    step=0.05
+BACKGROUND_SECONDS = st.sidebar.number_input(
+    "Background Scan Seconds",
+    min_value=10,
+    max_value=300,
+    value=20,
+    step=5
 )
 
-# Global runtime value
-MIN_EDGE = float(
-    min_edge_input
+st.sidebar.divider()
+
+st.sidebar.write(
+    "📱 WhatsApp"
 )
 
+st.sidebar.info(
+    "WhatsApp number अभी नहीं दिया गया है। "
+    "इसलिए WhatsApp sending OFF है।"
+)
 
 # ============================================================
-# 1. RSI SCANNER
-# ============================================================
-
-st.divider()
-
-st.header(
-    "1️⃣ 📈 Nifty 50 RSI + OBV Scanner"
-)
-
-st.caption(
-    "Fall → Sideways | RSI Rising | "
-    "OBV Rising | 20 SMA ±1%"
-)
-
-if st.button(
-    "🔄 Scan RSI + OBV",
-    key="rsi_button",
-    type="primary",
-    use_container_width=True
-):
-
-    try:
-
-        with st.spinner(
-            "RSI scanner चल रहा है..."
-        ):
-
-            result = scan_rsi(
-                jwt,
-                master
-            )
-
-        st.session_state[
-            "rsi_result"
-        ] = result
-
-        st.session_state[
-            "rsi_time"
-        ] = now_ist().strftime(
-            "%d-%m-%Y %H:%M:%S"
-        )
-
-        st.success(
-            f"RSI scan complete — "
-            f"{len(result)} stocks"
-        )
-
-    except Exception as e:
-
-        st.error(
-            "RSI Scanner Error: "
-            + str(e)
-        )
-
-show_result(
-    st.session_state.get(
-        "rsi_result",
-        pd.DataFrame()
-    ),
-    "rsi_obv_scanner.csv"
-)
-
-
-# ============================================================
-# 2. FUTURE > SPOT
+# BACKGROUND CONTROL
 # ============================================================
 
 st.divider()
 
 st.header(
-    "2️⃣ ⚡ Future > Spot Scanner"
+    "🔄 Background Parity Scanner"
 )
 
-st.caption(
-    "Current-month Future > Spot | "
-    "Difference × Lot"
-)
+c1, c2, c3 = st.columns(3)
 
-if st.button(
-    "🔄 Scan Future > Spot",
-    key="future_button",
-    type="primary",
-    use_container_width=True
-):
+with c1:
 
-    try:
+    if st.button(
+        "▶️ START BACKGROUND",
+        type="primary",
+        use_container_width=True
+    ):
 
-        with st.spinner(
-            "Future + Spot data..."
-        ):
+        if not background_running:
 
-            result = scan_future_spot(
-                jwt,
-                master
+            t = threading.Thread(
+                target=background_worker,
+                daemon=True
             )
 
-        st.session_state[
-            "future_result"
-        ] = result
+            t.start()
 
-        st.session_state[
-            "future_time"
-        ] = now_ist().strftime(
-            "%d-%m-%Y %H:%M:%S"
-        )
+            st.success(
+                "Background parity scanner START हो गया।"
+            )
+
+        else:
+
+            st.info(
+                "Background scanner पहले से चल रहा है।"
+            )
+
+with c2:
+
+    if st.button(
+        "🔄 REFRESH RESULT",
+        use_container_width=True
+    ):
+
+        st.rerun()
+
+with c3:
+
+    if st.button(
+        "🧹 CLEAR ALERTS",
+        use_container_width=True
+    ):
+
+        ALERT_QUEUE.clear()
+        ALERT_KEYS.clear()
 
         st.success(
-            f"Future-Spot scan complete — "
-            f"{len(result)} stocks"
+            "Alert history clear हो गई।"
         )
-
-    except Exception as e:
-
-        st.error(
-            "Future Scanner Error: "
-            + str(e)
-        )
-
-show_result(
-    st.session_state.get(
-        "future_result",
-        pd.DataFrame()
-    ),
-    "future_spot_scanner.csv"
-)
 
 
 # ============================================================
-# 3. ALL F&O STOCK PARITY
+# STATUS
 # ============================================================
 
-st.divider()
-
-st.header(
-    "3️⃣ ⚖️ ALL F&O Stock Put-Call Parity"
+status = GLOBAL_RESULTS.get(
+    "status",
+    "Stopped"
 )
 
-st.caption(
-    "All F&O Stocks | Current Month | "
-    "ATM ±10 = 21 Strikes | Both Directions | "
-    "Bid/Ask Executable Prices"
+last_scan = GLOBAL_RESULTS.get(
+    "last_scan",
+    ""
 )
 
-scan_button = st.button(
-    "🚀 Scan ALL F&O Stock Parity",
-    key="all_fno_parity_button",
-    type="primary",
-    use_container_width=True
+st.metric(
+    "Background Status",
+    status
 )
 
-# Auto update trigger
-if auto_update:
-    scan_button = True
+if last_scan:
+
+    st.caption(
+        "Last background scan: "
+        + last_scan
+    )
 
 
-if scan_button:
+# ============================================================
+# BACKGROUND RESULT
+# ============================================================
 
-    start_time = time.time()
-
-    try:
-
-        with st.spinner(
-            "⚡ सभी F&O stocks का fast Bid/Ask scan..."
-        ):
-
-            result = scan_all_fno_stock_parity(
-                jwt,
-                master
-            )
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # Replace old result ONLY after successful scan
-        # ----------------------------------------------------
-
-        st.session_state[
-            "stock_parity_result"
-        ] = result
-
-        st.session_state[
-            "stock_parity_time"
-        ] = now_ist().strftime(
-            "%d-%m-%Y %H:%M:%S"
-        )
-
-        elapsed = (
-            time.time()
-            - start_time
-        )
-
-        st.success(
-            f"Scan complete — "
-            f"{len(result)} opportunities | "
-            f"{elapsed:.1f} sec"
-        )
-
-    except Exception as e:
-
-        st.error(
-            "Stock Parity Error: "
-            + str(e)
-        )
-
-
-stock_parity_result = st.session_state.get(
-    "stock_parity_result",
+bg_result = GLOBAL_RESULTS.get(
+    "result",
     pd.DataFrame()
 )
 
-show_result(
-    stock_parity_result,
-    "all_fno_stock_parity.csv"
+st.header(
+    "🚨 Live Parity Opportunities"
 )
 
 if (
-    "stock_parity_time"
+    bg_result is None
+    or bg_result.empty
+):
+
+    st.info(
+        "अभी कोई qualifying parity opportunity नहीं मिली। "
+        "Background scanner चलने दें।"
+    )
+
+else:
+
+    st.success(
+        f"{len(bg_result)} live opportunities मिलीं।"
+    )
+
+    st.dataframe(
+        bg_result,
+        use_container_width=True,
+        hide_index=True,
+        height=650
+    )
+
+    csv = bg_result.to_csv(
+        index=False
+    ).encode(
+        "utf-8"
+    )
+
+    st.download_button(
+        "⬇️ Download Live Parity CSV",
+        data=csv,
+        file_name="live_fno_parity.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+
+# ============================================================
+# ALERT QUEUE
+# ============================================================
+
+st.divider()
+
+st.header(
+    "🚨 High Edge Alerts"
+)
+
+if not ALERT_QUEUE:
+
+    st.info(
+        "अभी कोई high-edge alert नहीं।"
+    )
+
+else:
+
+    alert_rows = []
+
+    for item in reversed(
+        ALERT_QUEUE[-100:]
+    ):
+
+        d = item["data"]
+
+        alert_rows.append({
+
+            "Time":
+                item["time"],
+
+            "Stock / Index":
+                d.get(
+                    "Stock",
+                    d.get(
+                        "Index",
+                        ""
+                    )
+                ),
+
+            "Direction":
+                d.get(
+                    "Direction",
+                    ""
+                ),
+
+            "Strike":
+                d.get(
+                    "Strike",
+                    ""
+                ),
+
+            "Edge/Unit":
+                d.get(
+                    "Edge/Unit",
+                    ""
+                ),
+
+            "Edge × Lot":
+                d.get(
+                    "Edge × Lot",
+                    d.get(
+                        "Edge × Contract",
+                        ""
+                    )
+                ),
+
+            "Margin":
+                d.get(
+                    "Margin",
+                    ""
+                ),
+
+            "ROM %":
+                d.get(
+                    "ROM %",
+                    ""
+                )
+        })
+
+    st.dataframe(
+        pd.DataFrame(
+            alert_rows
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ============================================================
+# MANUAL GROUP SCANNERS
+# ============================================================
+
+st.divider()
+
+st.header(
+    "⚡ Manual F&O Stock Scanners"
+)
+
+st.caption(
+    "Background scanner के अलावा A–M और N–Z को "
+    "अलग-अलग manually भी scan कर सकते हैं।"
+)
+
+master_manual = None
+
+# ============================================================
+# A-M
+# ============================================================
+
+col1, col2 = st.columns(2)
+
+with col1:
+
+    st.subheader(
+        "🅰️ F&O Stocks A–M"
+    )
+
+    if st.button(
+        "Scan A–M",
+        use_container_width=True
+    ):
+
+        try:
+
+            with st.spinner(
+                "A–M F&O stocks scan हो रहे हैं..."
+            ):
+
+                master_manual = prepare_master(
+                    download_master()
+                )
+
+                jwt = login()
+
+                expiry = stock_expiry(
+                    master_manual
+                )
+
+                futures = all_fno_futures(
+                    master_manual,
+                    expiry
+                )
+
+                stocks = sorted([
+                    s
+                    for s in futures
+                    if s[0] <= "M"
+                ])
+
+                result_am = scan_stock_group(
+                    jwt,
+                    master_manual,
+                    stocks
+                )
+
+                result_am = add_margins(
+                    jwt,
+                    result_am,
+                    master_manual,
+                    20
+                )
+
+            st.session_state[
+                "manual_am"
+            ] = result_am
+
+        except Exception as e:
+
+            st.error(
+                "A–M Error: "
+                + str(e)
+            )
+
+with col2:
+
+    st.subheader(
+        "🅽 F&O Stocks N–Z"
+    )
+
+    if st.button(
+        "Scan N–Z",
+        use_container_width=True
+    ):
+
+        try:
+
+            with st.spinner(
+                "N–Z F&O stocks scan हो रहे हैं..."
+            ):
+
+                master_manual = prepare_master(
+                    download_master()
+                )
+
+                jwt = login()
+
+                expiry = stock_expiry(
+                    master_manual
+                )
+
+                futures = all_fno_futures(
+                    master_manual,
+                    expiry
+                )
+
+                stocks = sorted([
+                    s
+                    for s in futures
+                    if s[0] > "M"
+                ])
+
+                result_nz = scan_stock_group(
+                    jwt,
+                    master_manual,
+                    stocks
+                )
+
+                result_nz = add_margins(
+                    jwt,
+                    result_nz,
+                    master_manual,
+                    20
+                )
+
+            st.session_state[
+                "manual_nz"
+            ] = result_nz
+
+        except Exception as e:
+
+            st.error(
+                "N–Z Error: "
+                + str(e)
+            )
+
+
+if (
+    "manual_am"
     in st.session_state
 ):
 
-    st.caption(
-        "Last successful update: "
-        +
+    st.subheader(
+        "A–M Results"
+    )
+
+    st.dataframe(
         st.session_state[
-            "stock_parity_time"
-        ]
+            "manual_am"
+        ],
+        use_container_width=True,
+        hide_index=True,
+        height=500
+    )
+
+
+if (
+    "manual_nz"
+    in st.session_state
+):
+
+    st.subheader(
+        "N–Z Results"
+    )
+
+    st.dataframe(
+        st.session_state[
+            "manual_nz"
+        ],
+        use_container_width=True,
+        hide_index=True,
+        height=500
     )
 
 
 # ============================================================
-# 4. BANKNIFTY
+# INDEX SCANNERS
 # ============================================================
 
 st.divider()
 
 st.header(
-    "4️⃣ 🏦 BankNifty Put-Call Parity"
+    "📊 Index Put-Call Parity"
 )
 
-st.caption(
-    "Bid/Ask | Both Directions | ATM ±10"
-)
+n1, n2, n3 = st.columns(3)
 
-if st.button(
-    "🔄 Scan BankNifty",
-    key="banknifty_button",
-    type="primary",
-    use_container_width=True
-):
+# ============================================================
+# NIFTY
+# ============================================================
 
-    try:
+with n1:
 
-        with st.spinner(
-            "BankNifty parity scan..."
-        ):
+    st.subheader(
+        "📈 NIFTY 50"
+    )
 
-            result = scan_index_parity(
-                jwt,
-                master,
-                "BANKNIFTY"
+    if st.button(
+        "Scan NIFTY 50",
+        use_container_width=True
+    ):
+
+        try:
+
+            with st.spinner(
+                "NIFTY 50 parity..."
+            ):
+
+                m = prepare_master(
+                    download_master()
+                )
+
+                j = login()
+
+                r = scan_index(
+                    j,
+                    m,
+                    "NIFTY"
+                )
+
+                r = add_margins(
+                    j,
+                    r,
+                    m,
+                    20
+                )
+
+            st.session_state[
+                "nifty_index_result"
+            ] = r
+
+        except Exception as e:
+
+            st.error(
+                "NIFTY Error: "
+                + str(e)
             )
 
-        st.session_state[
-            "banknifty_result"
-        ] = result
+# ============================================================
+# BANKNIFTY
+# ============================================================
 
-    except Exception as e:
+with n2:
 
-        st.error(
-            "BankNifty Error: "
-            + str(e)
-        )
+    st.subheader(
+        "🏦 BANKNIFTY"
+    )
 
-show_result(
-    st.session_state.get(
-        "banknifty_result",
-        pd.DataFrame()
-    ),
-    "banknifty_parity.csv"
-)
+    if st.button(
+        "Scan BANKNIFTY",
+        use_container_width=True
+    ):
+
+        try:
+
+            with st.spinner(
+                "BANKNIFTY parity..."
+            ):
+
+                m = prepare_master(
+                    download_master()
+                )
+
+                j = login()
+
+                r = scan_index(
+                    j,
+                    m,
+                    "BANKNIFTY"
+                )
+
+                r = add_margins(
+                    j,
+                    r,
+                    m,
+                    20
+                )
+
+            st.session_state[
+                "bank_index_result"
+            ] = r
+
+        except Exception as e:
+
+            st.error(
+                "BANKNIFTY Error: "
+                + str(e)
+            )
+
+# ============================================================
+# SENSEX
+# ============================================================
+
+with n3:
+
+    st.subheader(
+        "📊 SENSEX"
+    )
+
+    if st.button(
+        "Scan SENSEX",
+        use_container_width=True
+    ):
+
+        try:
+
+            with st.spinner(
+                "SENSEX parity..."
+            ):
+
+                m = prepare_master(
+                    download_master()
+                )
+
+                j = login()
+
+                r = scan_index(
+                    j,
+                    m,
+                    "SENSEX"
+                )
+
+                r = add_margins(
+                    j,
+                    r,
+                    m,
+                    20
+                )
+
+            st.session_state[
+                "sensex_index_result"
+            ] = r
+
+        except Exception as e:
+
+            st.error(
+                "SENSEX Error: "
+                + str(e)
+            )
 
 
 # ============================================================
-# 5. SENSEX
+# DISPLAY INDEX RESULTS
+# ============================================================
+
+if (
+    "nifty_index_result"
+    in st.session_state
+):
+
+    st.subheader(
+        "NIFTY 50 Results"
+    )
+
+    st.dataframe(
+        st.session_state[
+            "nifty_index_result"
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+if (
+    "bank_index_result"
+    in st.session_state
+):
+
+    st.subheader(
+        "BANKNIFTY Results"
+    )
+
+    st.dataframe(
+        st.session_state[
+            "bank_index_result"
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+if (
+    "sensex_index_result"
+    in st.session_state
+):
+
+    st.subheader(
+        "SENSEX Results"
+    )
+
+    st.dataframe(
+        st.session_state[
+            "sensex_index_result"
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ============================================================
+# AUTO REFRESH UI
 # ============================================================
 
 st.divider()
 
-st.header(
-    "5️⃣ 📊 Sensex Put-Call Parity"
+st.caption(
+    "⚡ Background scanner अलग thread में चलता है। "
+    "Page को बार-बार scan button दबाने की जरूरत नहीं।"
 )
 
 st.caption(
-    "Bid/Ask | Both Directions | ATM ±10"
-)
-
-if st.button(
-    "🔄 Scan Sensex",
-    key="sensex_button",
-    type="primary",
-    use_container_width=True
-):
-
-    try:
-
-        with st.spinner(
-            "Sensex parity scan..."
-        ):
-
-            result = scan_index_parity(
-                jwt,
-                master,
-                "SENSEX"
-            )
-
-        st.session_state[
-            "sensex_result"
-        ] = result
-
-    except Exception as e:
-
-        st.error(
-            "Sensex Error: "
-            + str(e)
-        )
-
-show_result(
-    st.session_state.get(
-        "sensex_result",
-        pd.DataFrame()
-    ),
-    "sensex_parity.csv"
-)
-
-
-# ============================================================
-# AUTO REFRESH
-# ============================================================
-
-if auto_update:
-
-    st.caption(
-        f"🔄 Auto Update ON — "
-        f"हर {refresh_seconds} सेकंड में नया scan"
-    )
-
-    time.sleep(
-        refresh_seconds
-    )
-
-    st.rerun()
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.divider()
-
-st.caption(
-    "⚡ Stock Parity: सभी उपलब्ध F&O stocks"
+    "📌 Bid/Ask आधारित executable parity इस्तेमाल हो रही है।"
 )
 
 st.caption(
-    "BUY हमेशा Ask और SELL हमेशा Bid "
-    "पर calculate किया जाता है।"
-)
-
-st.caption(
-    "दोनों directions independently scan होती हैं।"
-)
-
-st.caption(
-    "ATM से ±10 strikes यानी maximum 21 strikes "
-    "per stock scan होते हैं।"
-)
-
-st.caption(
-    "Estimated Margin केवल अनुमान है; "
-    "actual SPAN + Exposure margin broker के "
-    "actual requirement से अलग हो सकता है।"
-)
-
-st.caption(
-    "पुराना result अगले successful scan तक "
-    "session में saved रहता है।"
+    "📌 High-edge opportunity पहले alert queue में आएगी; "
+    "WhatsApp अभी credentials न होने के कारण OFF है।"
 )
