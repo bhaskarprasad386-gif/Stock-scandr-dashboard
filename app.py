@@ -6,6 +6,7 @@ import pyotp
 import time
 import io
 import zipfile
+
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -69,9 +70,9 @@ with st.sidebar:
     )
 
     parity_strikes = st.number_input(
-        "Strikes Around Future",
+        "Liquid Strikes Around Future",
         min_value=3,
-        max_value=20,
+        max_value=30,
         value=10,
         step=1
     )
@@ -141,6 +142,16 @@ with st.sidebar:
         max_value=365,
         value=365,
         step=30
+    )
+
+    st.subheader("Backtest")
+
+    backtest_holding_days = st.number_input(
+        "Holding Observations",
+        min_value=1,
+        max_value=20,
+        value=5,
+        step=1
     )
 
 
@@ -418,6 +429,32 @@ def prepare_master(master):
 
 
 # ============================================================
+# SAFE FLOAT
+# ============================================================
+
+def safe_float(x):
+
+    try:
+
+        if x is None:
+            return None
+
+        if isinstance(x, str):
+            x = x.replace(",", "").strip()
+
+        value = float(x)
+
+        if not np.isfinite(value):
+            return None
+
+        return value
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
 # FULL QUOTE
 # ============================================================
 
@@ -495,9 +532,7 @@ def batch_full_quote(
                 if not token:
                     continue
 
-                ltp = item.get(
-                    "ltp"
-                )
+                ltp = item.get("ltp")
 
                 bid = None
                 ask = None
@@ -581,18 +616,144 @@ def batch_full_quote(
     return result
 
 
-def safe_float(x):
+# ============================================================
+# STRICT LIQUIDITY
+# ============================================================
 
-    try:
+def quote_is_liquid(
+    q,
+    min_volume,
+    min_oi,
+    max_spread
+):
+    """
+    STRICT LIQUIDITY RULE
 
-        if x is None:
-            return None
+    Contract तभी liquid माना जाएगा जब:
 
-        return float(x)
+    1. LTP मौजूद
+    2. Bid मौजूद
+    3. Ask मौजूद
+    4. Bid > 0
+    5. Ask > 0
+    6. Ask >= Bid
+    7. Volume मौजूद
+    8. OI मौजूद
+    9. Volume minimum
+    10. OI minimum
+    11. Spread limit के अंदर
+    """
 
-    except Exception:
+    if not isinstance(q, dict):
+        return False
 
+    bid = q.get("bid")
+    ask = q.get("ask")
+    ltp = q.get("ltp")
+    volume = q.get("volume")
+    oi = q.get("oi")
+
+    # Missing data = reject
+    if (
+        bid is None
+        or ask is None
+        or ltp is None
+        or volume is None
+        or oi is None
+    ):
+        return False
+
+    # Numeric validity
+    if (
+        bid <= 0
+        or ask <= 0
+        or ltp <= 0
+        or volume <= 0
+        or oi <= 0
+    ):
+        return False
+
+    # Invalid book
+    if ask < bid:
+        return False
+
+    # Minimum liquidity
+    if volume < min_volume:
+        return False
+
+    if oi < min_oi:
+        return False
+
+    # Spread
+    spread_pct = (
+        (ask - bid)
+        / ltp
+    ) * 100
+
+    if spread_pct < 0:
+        return False
+
+    if spread_pct > max_spread:
+        return False
+
+    return True
+
+
+def future_quote_is_liquid(q):
+
+    if not isinstance(q, dict):
+        return False
+
+    bid = q.get("bid")
+    ask = q.get("ask")
+    ltp = q.get("ltp")
+
+    if (
+        bid is None
+        or ask is None
+        or ltp is None
+    ):
+        return False
+
+    if (
+        bid <= 0
+        or ask <= 0
+        or ltp <= 0
+    ):
+        return False
+
+    if ask < bid:
+        return False
+
+    spread_pct = (
+        (ask - bid)
+        / ltp
+    ) * 100
+
+    if spread_pct > max_spread_percent:
+        return False
+
+    return True
+
+
+def spread_percent(q):
+
+    bid = q.get("bid")
+    ask = q.get("ask")
+    ltp = q.get("ltp")
+
+    if (
+        bid is None
+        or ask is None
+        or ltp is None
+        or ltp <= 0
+    ):
         return None
+
+    return (
+        (ask - bid)
+        / ltp
+    ) * 100
 
 
 # ============================================================
@@ -892,77 +1053,6 @@ def stock_future_map(
             result[stock] = row
 
     return result
-
-
-# ============================================================
-# LIQUIDITY
-# ============================================================
-
-def quote_is_liquid(
-    q,
-    min_volume,
-    min_oi,
-    max_spread
-):
-
-    bid = q.get("bid")
-    ask = q.get("ask")
-    ltp = q.get("ltp")
-    volume = q.get("volume")
-    oi = q.get("oi")
-
-    if (
-        bid is None
-        or ask is None
-        or ltp is None
-    ):
-        return False
-
-    if bid <= 0 or ask <= 0:
-        return False
-
-    if ask < bid:
-        return False
-
-    if ltp <= 0:
-        return False
-
-    if (
-        volume is not None
-        and volume < min_volume
-    ):
-        return False
-
-    if (
-        oi is not None
-        and oi < min_oi
-    ):
-        return False
-
-    spread_pct = (
-        (ask - bid)
-        / ltp
-    ) * 100
-
-    if spread_pct > max_spread:
-        return False
-
-    return True
-
-
-def spread_percent(q):
-
-    bid = q.get("bid")
-    ask = q.get("ask")
-    ltp = q.get("ltp")
-
-    if not bid or not ask or not ltp:
-        return None
-
-    return (
-        (ask - bid)
-        / ltp
-    ) * 100
 
 
 # ============================================================
@@ -1527,6 +1617,7 @@ def stock_option_map(
                 typ
             )
         ] = {
+
             "token":
                 str(row["token"]),
 
@@ -1571,7 +1662,9 @@ def scan_stock_parity_part(
     ]
 
     future_tokens = [
-        str(fmap[s]["token"])
+        str(
+            fmap[s]["token"]
+        )
         for s in stocks
     ]
 
@@ -1608,18 +1701,19 @@ def scan_stock_parity_part(
             "ask"
         )
 
-        if (
-            future is None
-            or
-            future_bid is None
-            or
-            future_ask is None
+        # ====================================================
+        # FUTURE MUST BE LIQUID TOO
+        # ====================================================
+
+        if not future_quote_is_liquid(
+            fq
         ):
             continue
 
         if (
-            future_ask <=
-            future_bid
+            future is None
+            or future_bid is None
+            or future_ask is None
         ):
             continue
 
@@ -1631,6 +1725,10 @@ def scan_stock_parity_part(
 
         if not contracts:
             continue
+
+        # ====================================================
+        # STRIKES NEAREST TO FUTURE
+        # ====================================================
 
         strikes = sorted(
             set(
@@ -1688,6 +1786,7 @@ def scan_stock_parity_part(
                 )
             )
 
+            # दोनों contracts जरूरी
             if not ce or not pe:
                 continue
 
@@ -1701,8 +1800,10 @@ def scan_stock_parity_part(
                 {}
             )
 
-            # IMPORTANT:
-            # BOTH CE AND PE MUST BE LIQUID
+            # =================================================
+            # STRICT LIQUIDITY
+            # =================================================
+
             if not quote_is_liquid(
                 ceq,
                 min_option_volume,
@@ -1719,12 +1820,9 @@ def scan_stock_parity_part(
             ):
                 continue
 
-            # FUTURE MUST ALSO HAVE TWO SIDES
-            if (
-                future_bid <= 0
-                or future_ask <= 0
-            ):
-                continue
+            # =================================================
+            # EXECUTABLE PRICES
+            # =================================================
 
             ce_bid = ceq["bid"]
             ce_ask = ceq["ask"]
@@ -1732,13 +1830,13 @@ def scan_stock_parity_part(
             pe_bid = peq["bid"]
             pe_ask = peq["ask"]
 
-            # ------------------------------------------------
+            # =================================================
             # POSITIVE EXECUTABLE EDGE
             #
             # SELL CE
             # BUY PE
             # BUY FUTURE
-            # ------------------------------------------------
+            # =================================================
 
             positive = (
                 ce_bid
@@ -1751,13 +1849,13 @@ def scan_stock_parity_part(
                 )
             )
 
-            # ------------------------------------------------
+            # =================================================
             # NEGATIVE EXECUTABLE EDGE
             #
             # BUY CE
             # SELL PE
             # SELL FUTURE
-            # ------------------------------------------------
+            # =================================================
 
             negative = (
                 ce_ask
@@ -1771,10 +1869,12 @@ def scan_stock_parity_part(
             )
 
             candidates = [
+
                 (
                     positive,
                     "CE SELL / PE BUY / FUTURE BUY"
                 ),
+
                 (
                     negative,
                     "CE BUY / PE SELL / FUTURE SELL"
@@ -1786,6 +1886,10 @@ def scan_stock_parity_part(
                 key=lambda x:
                     abs(x[0])
             )
+
+            # =================================================
+            # MINIMUM EXECUTABLE EDGE
+            # =================================================
 
             if abs(
                 best_value
@@ -1801,7 +1905,6 @@ def scan_stock_parity_part(
                 * lot
             )
 
-            # conservative estimated capital
             future_margin_est = (
                 future
                 * lot
@@ -1820,7 +1923,6 @@ def scan_stock_parity_part(
                 option_premium
             )
 
-            # rough F&O round-trip charges
             fno_charges = (
                 calculate_future_charges(
                     future * lot,
@@ -1874,6 +1976,12 @@ def scan_stock_parity_part(
                         2
                     ),
 
+                "Future Spread %":
+                    round(
+                        spread_percent(fq),
+                        3
+                    ),
+
                 "Strike":
                     round(
                         strike,
@@ -1907,13 +2015,13 @@ def scan_stock_parity_part(
                 "CE Spread %":
                     round(
                         spread_percent(ceq),
-                        2
+                        3
                     ),
 
                 "PE Spread %":
                     round(
                         spread_percent(peq),
-                        2
+                        3
                     ),
 
                 "CE Volume":
@@ -2014,6 +2122,71 @@ def scan_stock_parity_part(
 
 
 # ============================================================
+# INDEX OPTION MAP
+# ============================================================
+
+def index_option_map(
+    master,
+    index_name,
+    expiry
+):
+
+    x = master[
+        (master["exchange"] == "NFO")
+        &
+        (master["name"] == index_name)
+        &
+        (master["expiry_date"] == expiry)
+        &
+        (master["instrument"] == "OPTIDX")
+    ]
+
+    result = {}
+
+    for _, row in x.iterrows():
+
+        strike = row["strike_num"]
+
+        if pd.isna(strike):
+            continue
+
+        symbol = str(
+            row["symbol"]
+        )
+
+        if symbol.endswith("CE"):
+            typ = "CE"
+
+        elif symbol.endswith("PE"):
+            typ = "PE"
+
+        else:
+            continue
+
+        result[
+            (
+                round(
+                    float(strike),
+                    2
+                ),
+                typ
+            )
+        ] = {
+
+            "token":
+                str(row["token"]),
+
+            "symbol":
+                symbol,
+
+            "lot":
+                int(row["lot_size"])
+        }
+
+    return result
+
+
+# ============================================================
 # INDEX PARITY
 # ============================================================
 
@@ -2065,6 +2238,12 @@ def scan_index_parity(
         ft,
         {}
     )
+
+    # Future must be liquid
+    if not future_quote_is_liquid(
+        fq
+    ):
+        return pd.DataFrame()
 
     future = fq.get("ltp")
     fb = fq.get("bid")
@@ -2156,6 +2335,10 @@ def scan_index_parity(
             {}
         )
 
+        # =====================================================
+        # STRICT LIQUIDITY
+        # =====================================================
+
         if not quote_is_liquid(
             ceq,
             min_option_volume,
@@ -2194,12 +2377,23 @@ def scan_index_parity(
             )
         )
 
-        best = max(
-            [
+        candidates = [
+
+            (
                 positive,
-                negative
-            ],
-            key=abs
+                "CE SELL / PE BUY / FUTURE BUY"
+            ),
+
+            (
+                negative,
+                "CE BUY / PE SELL / FUTURE SELL"
+            )
+        ]
+
+        best, side = max(
+            candidates,
+            key=lambda x:
+                abs(x[0])
         )
 
         if abs(best) <= threshold:
@@ -2210,6 +2404,9 @@ def scan_index_parity(
             "Index":
                 index_name,
 
+            "Trade":
+                side,
+
             "Expiry":
                 expiry.strftime(
                     "%d-%b-%Y"
@@ -2219,6 +2416,24 @@ def scan_index_parity(
                 round(
                     future,
                     2
+                ),
+
+            "Future Bid":
+                round(
+                    fb,
+                    2
+                ),
+
+            "Future Ask":
+                round(
+                    fa,
+                    2
+                ),
+
+            "Future Spread %":
+                round(
+                    spread_percent(fq),
+                    3
                 ),
 
             "Strike":
@@ -2238,6 +2453,18 @@ def scan_index_parity(
 
             "PE Ask":
                 peq["ask"],
+
+            "CE Spread %":
+                round(
+                    spread_percent(ceq),
+                    3
+                ),
+
+            "PE Spread %":
+                round(
+                    spread_percent(peq),
+                    3
+                ),
 
             "CE Volume":
                 ceq.get("volume"),
@@ -2293,11 +2520,7 @@ def scan_index_parity(
 # NSE BHAVCOPY
 # ============================================================
 
-@st.cache_data(
-    ttl=86400,
-    show_spinner=False
-)
-def download_nse_fo_bhavcopy(
+def nse_bhavcopy_url(
     date_obj
 ):
 
@@ -2309,28 +2532,25 @@ def download_nse_fo_bhavcopy(
         "%Y%m%d"
     )
 
-    ddmmyyyy = d.strftime(
-        "%d%m%Y"
+    return (
+        "https://nsearchives.nseindia.com/"
+        "content/fo/"
+        f"BhavCopy_NSE_FO_0_0_0_"
+        f"{yyyymmdd}_F_0000.csv.zip"
     )
 
-    urls = [
 
-        # New UDiFF style
-        (
-            "https://nsearchives.nseindia.com/"
-            "content/fo/"
-            f"BhavCopy_NSE_FO_0_0_0_"
-            f"{yyyymmdd}_F_0000.csv.zip"
-        ),
+@st.cache_data(
+    ttl=86400,
+    show_spinner=False
+)
+def download_nse_fo_bhavcopy(
+    date_obj
+):
 
-        # Alternate archive path
-        (
-            "https://nsearchives.nseindia.com/"
-            "content/fo/"
-            f"BhavCopy_NSE_FO_0_0_0_"
-            f"{yyyymmdd}_F_0000.csv.zip"
-        )
-    ]
+    url = nse_bhavcopy_url(
+        date_obj
+    )
 
     session = requests.Session()
 
@@ -2338,62 +2558,62 @@ def download_nse_fo_bhavcopy(
         NSE_HEADERS
     )
 
-    for url in urls:
+    try:
 
-        try:
+        r = session.get(
+            url,
+            timeout=45
+        )
 
-            r = session.get(
-                url,
-                timeout=30
+        if (
+            r.status_code != 200
+            or
+            len(r.content) < 500
+        ):
+            return pd.DataFrame()
+
+        z = zipfile.ZipFile(
+            io.BytesIO(
+                r.content
             )
+        )
 
-            if (
-                r.status_code != 200
-                or
-                len(r.content) < 500
-            ):
-                continue
+        names = z.namelist()
 
-            z = zipfile.ZipFile(
-                io.BytesIO(
-                    r.content
+        csv_name = next(
+            (
+                n for n in names
+                if n.lower().endswith(
+                    ".csv"
                 )
+            ),
+            None
+        )
+
+        if csv_name is None:
+            return pd.DataFrame()
+
+        with z.open(
+            csv_name
+        ) as f:
+
+            df = pd.read_csv(
+                f,
+                low_memory=False
             )
 
-            names = z.namelist()
+        if df.empty:
+            return pd.DataFrame()
 
-            csv_name = next(
-                (
-                    n for n in names
-                    if n.lower().endswith(
-                        ".csv"
-                    )
-                ),
-                None
-            )
+        return df
 
-            if csv_name is None:
-                continue
+    except Exception:
 
-            with z.open(
-                csv_name
-            ) as f:
-
-                df = pd.read_csv(
-                    f
-                )
-
-            if not df.empty:
-                return df
-
-        except Exception:
-            continue
-
-    return pd.DataFrame()
+        return pd.DataFrame()
 
 
 # ============================================================
-# NORMALIZE NSE BHAVCOPY
+# NORMALIZE UDIFF BHAVCOPY
 # ============================================================
 
 def normalize_fo_bhavcopy(
@@ -2406,15 +2626,25 @@ def normalize_fo_bhavcopy(
 
     x = df.copy()
 
+    # Remove BOM and normalize names
     x.columns = [
         str(c)
+        .replace(
+            "\ufeff",
+            ""
+        )
         .strip()
         .upper()
-        .replace(" ", "_")
-        for c in x.columns
+        .replace(
+            " ",
+            "_"
+        )
     ]
 
-    # Common UDiFF names
+    # ========================================================
+    # UDIFF / NEW FORMAT
+    # ========================================================
+
     rename_map = {
 
         "TCKR_SYMB":
@@ -2423,32 +2653,47 @@ def normalize_fo_bhavcopy(
         "FIN_INSTRM_ID":
             "TOKEN",
 
+        "FIN_INSTRM_TP":
+            "INSTRUMENT",
+
         "XPRY_DT":
             "EXPIRY",
 
-        "STRIKE_PRC":
+        "STRK_PRC":
             "STRIKE",
 
         "OPTN_TYP":
             "OPTION_TYPE",
 
-        "FIN_INSTRM_TP":
-            "INSTRUMENT",
-
         "CLSE_PRC":
             "CLOSE",
+
+        "OPN_INTRST":
+            "OI",
+
+        "CHNG_IN_OPN_INTRST":
+            "CHANGE_OI",
+
+        "TTL_TRADG_QTY":
+            "VOLUME",
 
         "TTLE_TRADG_QTY":
             "VOLUME",
 
-        "OPN_INTRST":
-            "OI",
+        "TtlTradgVol":
+            "VOLUME",
 
         "UNDRLYNG":
             "UNDERLYING",
 
         "UNDRLYNG_ASSET":
-            "UNDERLYING"
+            "UNDERLYING",
+
+        "TRAD_DT":
+            "TRADE_DATE",
+
+        "TRADG_DT":
+            "TRADE_DATE"
     }
 
     for old, new in rename_map.items():
@@ -2461,11 +2706,11 @@ def normalize_fo_bhavcopy(
                 inplace=True
             )
 
-    # Older NSE names
-    legacy = {
+    # ========================================================
+    # LEGACY NAMES
+    # ========================================================
 
-        "SYMBOL":
-            "SYMBOL",
+    legacy = {
 
         "EXPIRY_DT":
             "EXPIRY",
@@ -2476,25 +2721,24 @@ def normalize_fo_bhavcopy(
         "OPTION_TYP":
             "OPTION_TYPE",
 
-        "INSTRUMENT":
-            "INSTRUMENT",
-
-        "CLOSE":
-            "CLOSE",
+        "OPEN_INT":
+            "OI",
 
         "CONTRACTS":
             "VOLUME",
 
-        "OPEN_INT":
-            "OI"
+        "TOTTRDQTY":
+            "VOLUME"
     }
 
     for old, new in legacy.items():
 
         if (
             old in x.columns
-            and new not in x.columns
+            and
+            new not in x.columns
         ):
+
             x.rename(
                 columns={
                     old: new
@@ -2502,16 +2746,29 @@ def normalize_fo_bhavcopy(
                 inplace=True
             )
 
+    # ========================================================
+    # DATE
+    # ========================================================
+
     x["DATE"] = pd.Timestamp(
         date_obj
     )
+
+    # ========================================================
+    # EXPIRY
+    # ========================================================
 
     if "EXPIRY" in x.columns:
 
         x["EXPIRY"] = pd.to_datetime(
             x["EXPIRY"],
-            errors="coerce"
+            errors="coerce",
+            dayfirst=True
         )
+
+    # ========================================================
+    # NUMERIC
+    # ========================================================
 
     for col in [
         "STRIKE",
@@ -2527,11 +2784,58 @@ def normalize_fo_bhavcopy(
                 errors="coerce"
             )
 
+    # ========================================================
+    # INSTRUMENT
+    # ========================================================
+
+    if "INSTRUMENT" in x.columns:
+
+        x["INSTRUMENT"] = (
+            x["INSTRUMENT"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+
+    # ========================================================
+    # SYMBOL
+    # ========================================================
+
+    if "SYMBOL" in x.columns:
+
+        x["SYMBOL"] = (
+            x["SYMBOL"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+
     return x
 
 
 # ============================================================
-# DOWNLOAD 1 YEAR NSE DATA
+# PARALLEL NSE DAY DOWNLOAD
+# ============================================================
+
+def download_one_nse_day(
+    date_obj
+):
+
+    raw = download_nse_fo_bhavcopy(
+        date_obj
+    )
+
+    if raw.empty:
+        return pd.DataFrame()
+
+    return normalize_fo_bhavcopy(
+        raw,
+        date_obj
+    )
+
+
+# ============================================================
+# DOWNLOAD NSE HISTORICAL DATA
 # ============================================================
 
 @st.cache_data(
@@ -2552,12 +2856,19 @@ def load_nse_year(
         )
     ).date()
 
-    # weekdays only
     dates = pd.date_range(
         start,
         end,
         freq="B"
     )
+
+    dates = [
+        d.date()
+        for d in dates
+    ]
+
+    if not dates:
+        return pd.DataFrame()
 
     all_data = []
 
@@ -2565,48 +2876,79 @@ def load_nse_year(
         0
     )
 
+    status = st.empty()
+
     total = len(dates)
 
-    for i, d in enumerate(
-        dates
-    ):
+    # NSE पर बहुत ज्यादा pressure न डालने के लिए
+    # limited workers
+    max_workers = 6
 
-        df = download_nse_fo_bhavcopy(
-            d
-        )
+    with ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
 
-        if not df.empty:
-
-            df = normalize_fo_bhavcopy(
-                df,
+        futures = {
+            executor.submit(
+                download_one_nse_day,
                 d
+            ): d
+            for d in dates
+        }
+
+        completed = 0
+
+        for future in as_completed(
+            futures
+        ):
+
+            completed += 1
+
+            try:
+
+                df = future.result()
+
+                if not df.empty:
+                    all_data.append(df)
+
+            except Exception:
+                pass
+
+            progress.progress(
+                int(
+                    completed /
+                    total *
+                    100
+                )
             )
 
-            all_data.append(
-                df
+            status.info(
+                f"NSE Bhavcopy: "
+                f"{completed}/{total} days processed"
             )
-
-        progress.progress(
-            int(
-                (i + 1)
-                / total
-                * 100
-            )
-        )
 
     progress.empty()
+    status.empty()
 
     if not all_data:
         return pd.DataFrame()
 
-    return pd.concat(
+    result = pd.concat(
         all_data,
         ignore_index=True
     )
 
+    if "DATE" in result.columns:
+
+        result = result.sort_values(
+            "DATE"
+        )
+
+    return result
+
 
 # ============================================================
-# ROLLOVER DATA PREPARATION
+# FIND COLUMN
 # ============================================================
 
 def find_col(
@@ -2621,6 +2963,10 @@ def find_col(
 
     return None
 
+
+# ============================================================
+# PREPARE ROLLOVER
+# ============================================================
 
 def prepare_rollover_data(
     df
@@ -2658,6 +3004,7 @@ def prepare_rollover_data(
         [
             "VOLUME",
             "TTLE_TRADG_QTY",
+            "TTL_TRADG_QTY",
             "CONTRACTS"
         ]
     )
@@ -2702,7 +3049,8 @@ def prepare_rollover_data(
 
     x["EXPIRY_X"] = pd.to_datetime(
         x[expiry_col],
-        errors="coerce"
+        errors="coerce",
+        dayfirst=True
     )
 
     x["CLOSE_X"] = pd.to_numeric(
@@ -2738,7 +3086,10 @@ def prepare_rollover_data(
 
         x["INSTRUMENT_X"] = ""
 
-    # Futures only
+    # ========================================================
+    # FUTURES ONLY
+    # ========================================================
+
     x = x[
         x["INSTRUMENT_X"].str.contains(
             "FUT",
@@ -2753,6 +3104,9 @@ def prepare_rollover_data(
         &
         x["OI_X"].notna()
     ]
+
+    if "DATE" not in x.columns:
+        return pd.DataFrame()
 
     return x
 
@@ -2873,15 +3227,21 @@ def calculate_rollover_signals(
             ):
                 continue
 
-            current_price = r[
-                "Current_Close"
-            ]
+            current_price = safe_float(
+                r["Current_Close"]
+            )
 
-            next_price = r[
-                "Next_Close"
-            ]
+            next_price = safe_float(
+                r["Next_Close"]
+            )
 
-            if current_price <= 0:
+            if (
+                current_price is None
+                or
+                next_price is None
+                or
+                current_price <= 0
+            ):
                 continue
 
             rollover_cost = (
@@ -2989,14 +3349,17 @@ def add_bullish_score(
             .shift(5)
         )
 
-        g["Price_Change_5D"] = (
+        g["Price_Change_5D"] = np.where(
+            g["Price_5D"] > 0,
             (
-                g["Current Future"]
-                /
-                g["Price_5D"]
+                (
+                    g["Current Future"]
+                    /
+                    g["Price_5D"]
+                )
                 - 1
-            )
-            * 100
+            ) * 100,
+            np.nan
         )
 
         g["Bullish"] = (
@@ -3044,7 +3407,6 @@ def rollover_scanner(
         latest["Bullish"] == True
     ]
 
-    # high rollover + positive price
     latest["Score"] = (
         latest["Rollover OI %"]
         +
@@ -3077,11 +3439,12 @@ def rollover_scanner(
 
 
 # ============================================================
-# 1 YEAR ROLLOVER BACKTEST
+# BACKTEST
 # ============================================================
 
 def rollover_backtest(
-    df
+    df,
+    holding_days=5
 ):
 
     x = calculate_rollover_signals(
@@ -3108,12 +3471,9 @@ def rollover_backtest(
         "Stock"
     ):
 
-        g = g.copy()
-
-        # signal:
-        # bullish 5D
-        # high rollover
-        # positive rollover cost
+        g = g.copy().reset_index(
+            drop=True
+        )
 
         signal = (
             (g["Bullish"] == True)
@@ -3143,22 +3503,34 @@ def rollover_backtest(
                 g["Date"]
                 >
                 entry_date
-            ].head(5)
+            ].head(
+                int(holding_days)
+            )
 
-            if future.empty:
+            if len(future) < int(
+                holding_days
+            ):
                 continue
 
-            exit_row = future.iloc[-1]
+            exit_row = future.iloc[
+                int(holding_days) - 1
+            ]
 
-            entry_price = float(
+            entry_price = safe_float(
                 row["Current Future"]
             )
 
-            exit_price = float(
+            exit_price = safe_float(
                 exit_row["Current Future"]
             )
 
-            if entry_price <= 0:
+            if (
+                entry_price is None
+                or
+                exit_price is None
+                or
+                entry_price <= 0
+            ):
                 continue
 
             return_pct = (
@@ -3191,7 +3563,7 @@ def rollover_backtest(
                 "Exit Future":
                     exit_price,
 
-                "Rollover %":
+                "Rollover OI %":
                     row["Rollover OI %"],
 
                 "Rollover Cost %":
@@ -3200,13 +3572,20 @@ def rollover_backtest(
                 "5D Price Change %":
                     row["Price_Change_5D"],
 
+                "Holding Days":
+                    int(
+                        holding_days
+                    ),
+
                 "Return %":
                     return_pct,
 
                 "Win":
-                    "YES"
-                    if return_pct > 0
-                    else "NO"
+                    (
+                        "YES"
+                        if return_pct > 0
+                        else "NO"
+                    )
             })
 
     result = pd.DataFrame(
@@ -3443,7 +3822,7 @@ st.header(
 )
 
 st.caption(
-    "Spot खरीदना + 75% MTF funding + "
+    "Spot खरीदना + MTF funding + "
     "expiry तक interest + charges + NET profit"
 )
 
@@ -3511,7 +3890,8 @@ st.header(
 )
 
 st.caption(
-    "केवल liquid CE + PE + Future contracts"
+    "STRICT LIQUIDITY: CE + PE + Future "
+    "तीनों में executable Bid/Ask जरूरी"
 )
 
 if st.button(
@@ -3557,6 +3937,10 @@ st.header(
     "3️⃣ ⚖️ Stock Parity — Part 2"
 )
 
+st.caption(
+    "केवल liquid strikes result में आएंगे"
+)
+
 if st.button(
     "🚀 Run Stock Parity Part 2",
     key="stock_part_2",
@@ -3598,6 +3982,10 @@ st.divider()
 
 st.header(
     "4️⃣ ⚖️ Stock Parity — Part 3"
+)
+
+st.caption(
+    "Illiquid CE/PE automatically reject"
 )
 
 if st.button(
@@ -3643,6 +4031,10 @@ st.header(
     "5️⃣ 📊 Nifty 50 Liquid Put-Call Parity"
 )
 
+st.caption(
+    "सिर्फ liquid CE + PE + Future"
+)
+
 if st.button(
     "🔄 Scan Nifty 50",
     key="nifty",
@@ -3651,7 +4043,7 @@ if st.button(
 ):
 
     with st.spinner(
-        "Nifty parity..."
+        "Nifty liquid parity..."
     ):
 
         result = scan_index_parity(
@@ -3686,6 +4078,10 @@ st.header(
     "6️⃣ 🏦 BankNifty Liquid Put-Call Parity"
 )
 
+st.caption(
+    "सिर्फ liquid CE + PE + Future"
+)
+
 if st.button(
     "🔄 Scan BankNifty",
     key="banknifty",
@@ -3694,7 +4090,7 @@ if st.button(
 ):
 
     with st.spinner(
-        "BankNifty parity..."
+        "BankNifty liquid parity..."
     ):
 
         result = scan_index_parity(
@@ -3730,8 +4126,8 @@ st.header(
 )
 
 st.caption(
-    "NSE F&O Bhavcopy | High rollover OI + "
-    "positive 5-day future trend + rollover cost"
+    "NSE F&O UDiFF Bhavcopy | "
+    "High rollover OI + positive 5-day trend + rollover cost"
 )
 
 if st.button(
@@ -3742,7 +4138,7 @@ if st.button(
 ):
 
     with st.spinner(
-        "NSE rollover data download/calculation..."
+        "NSE Bhavcopy download/calculation..."
     ):
 
         nse_data = load_nse_year(
@@ -3768,30 +4164,29 @@ show_result(
 
 
 # ============================================================
-# 1 YEAR BACKTEST
+# BACKTEST
 # ============================================================
 
 st.divider()
 
 st.header(
-    "8️⃣ 📚 NSE Bhavcopy — 1 Year Rollover Backtest"
+    "8️⃣ 📚 NSE Bhavcopy Rollover Backtest"
 )
 
 st.caption(
-    "Historical NSE F&O Bhavcopy/UDiFF data से "
-    "signal → अगले 5 trading observations का result"
+    "NSE F&O UDiFF Bhavcopy → "
+    "Signal → अगले selected trading observations → Return"
 )
 
 if st.button(
-    "🧪 Run 1-Year Rollover Backtest",
+    "🧪 Run NSE Bhavcopy Backtest",
     key="backtest",
     type="primary",
     use_container_width=True
 ):
 
     with st.spinner(
-        "लगभग 1 साल की NSE F&O bhavcopy "
-        "download और backtest हो रही है..."
+        "NSE historical Bhavcopy download और backtest..."
     ):
 
         nse_data = load_nse_year(
@@ -3799,7 +4194,8 @@ if st.button(
         )
 
         bt = rollover_backtest(
-            nse_data
+            nse_data,
+            int(backtest_holding_days)
         )
 
     st.session_state[
@@ -3842,8 +4238,20 @@ if summary:
         f'{summary["Max Drawdown %"]:.2f}%'
     )
 
-    st.write(
-        "Compounded Return:",
+    c5, c6, c7 = st.columns(3)
+
+    c5.metric(
+        "Winning Trades",
+        summary["Winning Trades"]
+    )
+
+    c6.metric(
+        "Losing Trades",
+        summary["Losing Trades"]
+    )
+
+    c7.metric(
+        "Compounded Return",
         f'{summary["Compounded Return %"]:.2f}%'
     )
 
@@ -3853,12 +4261,12 @@ show_result(
         "backtest_result",
         pd.DataFrame()
     ),
-    "nse_rollover_1year_backtest.csv"
+    "nse_rollover_backtest.csv"
 )
 
 
 # ============================================================
-# NOTES
+# RULES
 # ============================================================
 
 st.divider()
@@ -3869,74 +4277,124 @@ st.subheader(
 
 st.markdown(
     """
-### Stock Parity
+## ⚖️ Stock / Index Put-Call Parity
 
-**Result में केवल liquid contract आएगा:**
+### केवल LIQUID contracts
 
-- CE में Bid + Ask जरूरी
-- PE में Bid + Ask जरूरी
-- Future में Bid + Ask जरूरी
-- CE volume minimum filter
-- PE volume minimum filter
-- CE OI minimum filter
-- PE OI minimum filter
-- Bid/Ask spread maximum filter
-- Zero/stale quote reject
-- CE और PE दोनों liquid होना जरूरी
-- सिर्फ theoretical LTP parity नहीं
-- **Executable Bid/Ask parity** से ranking
+एक strike तभी result में आएगा जब:
 
-### Future > Spot
+- CE Bid मौजूद हो
+- CE Ask मौजूद हो
+- CE Volume मौजूद हो
+- CE OI मौजूद हो
+- CE Volume minimum से ऊपर हो
+- CE OI minimum से ऊपर हो
+- CE Bid/Ask spread limit के अंदर हो
 
-- Stock Spot खरीदा
-- MTF funding default 75%
-- आपकी capital default 25%
-- 0.041% daily MTF interest
-- Current expiry तक days
+और:
+
+- PE Bid मौजूद हो
+- PE Ask मौजूद हो
+- PE Volume मौजूद हो
+- PE OI मौजूद हो
+- PE Volume minimum से ऊपर हो
+- PE OI minimum से ऊपर हो
+- PE Bid/Ask spread limit के अंदर हो
+
+और:
+
+- Future Bid मौजूद हो
+- Future Ask मौजूद हो
+- Future spread acceptable हो
+
+### इसलिए:
+
+**CE liquid + PE liquid + Future liquid**
+
+तीनों के बिना strike result में नहीं आएगा।
+
+### Executable calculation
+
+Positive side:
+
+**SELL CE + BUY PE + BUY FUTURE**
+
+Negative side:
+
+**BUY CE + SELL PE + SELL FUTURE**
+
+LTP से theoretical parity नहीं निकाली जाती।
+
+---
+
+## ⚡ Future > Spot
+
+- Spot buy
+- MTF funding
+- आपकी own capital
+- MTF interest
 - Equity charges
 - Future charges
 - Gross spread
-- Interest
-- **NET PROFIT**
-- ROI on own capital
+- NET profit
+- ROI
 
-### Rollover
+---
 
-NSE F&O historical bhavcopy से:
+## 🔥 Rollover
+
+NSE F&O Bhavcopy से:
 
 - Current expiry
 - Next expiry
-- Current Future price
-- Next Future price
+- Current future price
+- Next future price
+- Current OI
+- Next OI
 - Rollover OI %
 - Rollover cost %
 - Volume
-- 5-day bullish trend
+- 5-day price trend
 
-निकाला जाता है।
+---
 
-### Backtest
+## 🧪 Backtest
 
 Signal:
 
-**Bullish 5D + Rollover OI ≥ 50% + Positive Rollover Cost**
+**5D bullish price trend**
 
-के बाद अगले 5 available trading observations का future return calculate किया जाता है।
++
+
+**Rollover OI >= 50%**
+
++
+
+**Positive rollover cost**
+
+के बाद:
+
+**Selected holding observations**
+
+का actual historical future return निकाला जाता है।
+
+---
+
+## 📡 Data
+
+Live market data:
+
+**Angel One SmartAPI**
+
+Historical derivative data:
+
+**NSE F&O UDiFF Bhavcopy**
 """
 )
 
-
 st.caption(
-    "📡 Live market data: Angel One SmartAPI"
-)
-
-st.caption(
-    "📚 Historical derivatives data: NSE F&O Bhavcopy / UDiFF"
-)
-
-st.caption(
-    "⚠️ Margin और charges estimates हैं; actual RMS/contract "
-    "charges broker/exchange settlement के अनुसार अलग हो सकते हैं।"
+    "⚠️ Margin, brokerage और charges estimates हैं। "
+    "Actual broker RMS/margin/charges अलग हो सकते हैं।"
 )
 
 
