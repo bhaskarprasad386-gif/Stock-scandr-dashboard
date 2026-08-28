@@ -1,6 +1,6 @@
-streamlit
-requests
-pandas
-numpy
-pyotp
-openpyxl
+streamlit==1.28.0
+requests==2.31.0
+pandas==2.1.1
+numpy==1.24.3
+pyotp==2.9.0
+python-dateutil==2.8.2
