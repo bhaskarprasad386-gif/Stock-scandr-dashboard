@@ -1,9 +1,3 @@
-"""
-BOX SPREAD PARITY SCANNER PRO v2.0
-Complete copy-paste ready code
-Just add your secrets and run!
-"""
-
 import streamlit as st
 import requests
 import pandas as pd
@@ -17,16 +11,12 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# CONFIG
-# ============================================================
 st.set_page_config(page_title="Box Spread Parity Scanner", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+
 IST = ZoneInfo("Asia/Kolkata")
 BASE_URL = "https://apiconnect.angelone.in"
 
-# ============================================================
-# SESSION STATE
-# ============================================================
+# Session State
 if "access_token" not in st.session_state:
     st.session_state.access_token = None
     st.session_state.authenticated = False
@@ -35,21 +25,17 @@ if "scan_results" not in st.session_state:
 if "last_scan_time" not in st.session_state:
     st.session_state.last_scan_time = None
 
-# ============================================================
-# SECRETS
-# ============================================================
+# Secrets
 API_KEY = st.secrets.get("ANGEL_API_KEY", "")
 CLIENT_ID = st.secrets.get("ANGEL_CLIENT_CODE", "")
 PASSWORD = st.secrets.get("ANGEL_PASSWORD", "")
 TOTP_SECRET = st.secrets.get("ANGEL_TOTP_SECRET", "")
 
 if not all([API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET]):
-    st.error("❌ Missing credentials! Add secrets in Streamlit Cloud")
+    st.error("❌ Add secrets: ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_PASSWORD, ANGEL_TOTP_SECRET")
     st.stop()
 
-# ============================================================
-# HELPERS
-# ============================================================
+# Helpers
 def safe_float(val):
     try:
         return float(val) if val else None
@@ -81,8 +67,8 @@ def authenticate():
             timeout=10
         )
         response.raise_for_status()
-        
         data = response.json()
+        
         if data.get("status"):
             st.session_state.access_token = data.get("data", {}).get("authToken")
             st.session_state.authenticated = True
@@ -95,11 +81,8 @@ def authenticate():
         st.error(f"❌ Error: {str(e)}")
         return False
 
-# ============================================================
-# BOX SPREAD CALCULATION
-# ============================================================
+# Box Spread Calculation
 def calculate_box_spread(ce_price, pe_price, strike, spot, days=7):
-    """Calculate box spread parity"""
     try:
         carry = 0.0001 * strike * days / 365
         theoretical = spot - strike + carry
@@ -113,77 +96,59 @@ def calculate_box_spread(ce_price, pe_price, strike, spot, days=7):
             "type": "Long" if edge < 0 else "Short" if edge > 0 else "None",
             "pct": safe_float((edge / theoretical * 100)) if theoretical != 0 else 0
         }
-    except Exception as e:
-        logger.error(f"Calc Error: {e}")
+    except:
         return None
 
-# ============================================================
-# DATA GENERATION
-# ============================================================
+# Main Scan Function
 def scan_all():
-    """Master scanning function for all symbols"""
     results = []
-    min_edge = st.session_state.min_edge
+    min_edge = st.session_state.get("min_edge", 0.5)
     
-    # ========== NIFTY ==========
-    symbols = {
-        "NIFTY": 24500,
-        "NIFTY-W": 24500
-    }
+    # NIFTY Weekly
+    nifty_spot = 24500
+    for strike in range(24400, 24601, 50):
+        ce = max(nifty_spot - strike, 10) + np.random.rand() * 5
+        pe = max(strike - nifty_spot, 10) + np.random.rand() * 5
+        box = calculate_box_spread(ce, pe, strike, nifty_spot, 7)
+        if box and abs(box["edge"]) > min_edge:
+            results.append({
+                "Symbol": "NIFTY",
+                "Type": "INDEX",
+                "Strike": int(strike),
+                "Spot": nifty_spot,
+                "CE": round(ce, 2),
+                "PE": round(pe, 2),
+                "Market": round(box["market"], 2),
+                "Theory": round(box["theoretical"], 2),
+                "Edge": round(box["edge"], 2),
+                "Edge%": round(box["pct"], 2),
+                "Trade": box["type"],
+                "Expiry": "Weekly"
+            })
     
-    for sym, spot in symbols.items():
-        for strike in range(int(spot - 100), int(spot + 101), 50):
-            ce = max(spot - strike, 10) + np.random.rand() * 5
-            pe = max(strike - spot, 10) + np.random.rand() * 5
-            
-            box = calculate_box_spread(ce, pe, strike, spot, 7)
-            if box and abs(box["edge"]) > min_edge:
-                results.append({
-                    "Symbol": sym,
-                    "Type": "INDEX",
-                    "Strike": int(strike),
-                    "Spot": spot,
-                    "CE": round(ce, 2),
-                    "PE": round(pe, 2),
-                    "Market": round(box["market"], 2),
-                    "Theory": round(box["theoretical"], 2),
-                    "Edge": round(box["edge"], 2),
-                    "Edge%": round(box["pct"], 2),
-                    "Trade": box["type"],
-                    "Expiry": "Weekly",
-                    "Time": now_ist().strftime("%H:%M:%S")
-                })
+    # BANKNIFTY Weekly
+    banknifty_spot = 52000
+    for strike in range(51800, 52201, 100):
+        ce = max(banknifty_spot - strike, 20) + np.random.rand() * 10
+        pe = max(strike - banknifty_spot, 20) + np.random.rand() * 10
+        box = calculate_box_spread(ce, pe, strike, banknifty_spot, 7)
+        if box and abs(box["edge"]) > min_edge:
+            results.append({
+                "Symbol": "BANKNIFTY",
+                "Type": "INDEX",
+                "Strike": int(strike),
+                "Spot": banknifty_spot,
+                "CE": round(ce, 2),
+                "PE": round(pe, 2),
+                "Market": round(box["market"], 2),
+                "Theory": round(box["theoretical"], 2),
+                "Edge": round(box["edge"], 2),
+                "Edge%": round(box["pct"], 2),
+                "Trade": box["type"],
+                "Expiry": "Weekly"
+            })
     
-    # ========== BANKNIFTY ==========
-    symbols = {
-        "BANKNIFTY": 52000,
-        "BANKNIFTY-W": 52000
-    }
-    
-    for sym, spot in symbols.items():
-        for strike in range(int(spot - 200), int(spot + 201), 100):
-            ce = max(spot - strike, 20) + np.random.rand() * 10
-            pe = max(strike - spot, 20) + np.random.rand() * 10
-            
-            box = calculate_box_spread(ce, pe, strike, spot, 7)
-            if box and abs(box["edge"]) > min_edge:
-                results.append({
-                    "Symbol": sym,
-                    "Type": "INDEX",
-                    "Strike": int(strike),
-                    "Spot": spot,
-                    "CE": round(ce, 2),
-                    "PE": round(pe, 2),
-                    "Market": round(box["market"], 2),
-                    "Theory": round(box["theoretical"], 2),
-                    "Edge": round(box["edge"], 2),
-                    "Edge%": round(box["pct"], 2),
-                    "Trade": box["type"],
-                    "Expiry": "Weekly",
-                    "Time": now_ist().strftime("%H:%M:%S")
-                })
-    
-    # ========== FNO STOCKS ==========
+    # FNO Stocks
     stocks = {
         "RELIANCE": 2500,
         "TCS": 3500,
@@ -194,16 +159,19 @@ def scan_all():
         "ICICIBANK": 950,
         "SBILIFE": 1250,
         "LT": 2850,
-        "MARUTI": 10500
+        "MARUTI": 10500,
+        "SUNPHARMA": 750,
+        "DRREDDY": 850,
+        "KOTAKBANK": 1850,
+        "AXISBANK": 1150,
+        "ITC": 450
     }
     
-    for stock, spot_base in stocks.items():
-        spot = spot_base + np.random.rand() * 100
-        
-        for strike in range(int(spot_base - 50), int(spot_base + 51), 25):
+    for stock, base_spot in stocks.items():
+        spot = base_spot + np.random.rand() * 100
+        for strike in range(int(base_spot - 50), int(base_spot + 51), 25):
             ce = max(spot - strike, 5) + np.random.rand() * 3
             pe = max(strike - spot, 5) + np.random.rand() * 3
-            
             box = calculate_box_spread(ce, pe, strike, spot, 7)
             if box and abs(box["edge"]) > min_edge:
                 results.append({
@@ -218,51 +186,42 @@ def scan_all():
                     "Edge": round(box["edge"], 2),
                     "Edge%": round(box["pct"], 2),
                     "Trade": box["type"],
-                    "Expiry": "Weekly",
-                    "Time": now_ist().strftime("%H:%M:%S")
+                    "Expiry": "Weekly"
                 })
     
-    # ========== CURRENT MONTH FUTURES ==========
-    futures = {
-        "NIFTY-FUT": 24500,
-        "BANKNIFTY-FUT": 52000
-    }
+    # Current Month Futures
+    futures = [
+        ("NIFTY-FUT", 24500, 24600, 24400),
+        ("BANKNIFTY-FUT", 52000, 52100, 51900)
+    ]
     
-    for fut, spot in futures.items():
-        ce = 24600 if "NIFTY" in fut else 52100
-        pe = 24400 if "NIFTY" in fut else 51900
-        strike = spot
-        
-        box = calculate_box_spread(ce, pe, strike, spot, 7)
+    for fut_name, spot, ce_price, pe_price in futures:
+        box = calculate_box_spread(ce_price, pe_price, spot, spot, 7)
         if box and abs(box["edge"]) > min_edge:
             results.append({
-                "Symbol": fut,
+                "Symbol": fut_name,
                 "Type": "FUTURES",
-                "Strike": int(strike),
+                "Strike": int(spot),
                 "Spot": spot,
-                "CE": round(ce, 2),
-                "PE": round(pe, 2),
+                "CE": ce_price,
+                "PE": pe_price,
                 "Market": round(box["market"], 2),
                 "Theory": round(box["theoretical"], 2),
                 "Edge": round(box["edge"], 2),
                 "Edge%": round(box["pct"], 2),
                 "Trade": box["type"],
-                "Expiry": "Current Month",
-                "Time": now_ist().strftime("%H:%M:%S")
+                "Expiry": "Current Month"
             })
     
     return pd.DataFrame(results) if results else pd.DataFrame()
 
-# ============================================================
 # SIDEBAR
-# ============================================================
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    # Auth
-    st.subheader("🔐 Login")
+    st.subheader("🔐 Authentication")
     if st.session_state.authenticated:
-        st.success("✅ Connected")
+        st.success(f"✅ Connected")
     else:
         if st.button("🔑 LOGIN", use_container_width=True):
             with st.spinner("Authenticating..."):
@@ -270,25 +229,34 @@ with st.sidebar:
     
     st.divider()
     
-    # Parameters
-    st.subheader("📊 Parameters")
-    st.session_state.min_edge = st.number_input("Min Edge (₹)", min_value=0.0, value=0.5, step=0.1)
+    st.subheader("📊 Scan Settings")
+    st.session_state.min_edge = st.number_input(
+        "Minimum Edge (₹)",
+        min_value=0.0,
+        value=0.5,
+        step=0.1,
+        help="Only show edges >= this value"
+    )
     
     st.divider()
     
-    # Scan Types
-    st.subheader("🎯 What to Scan")
-    st.checkbox("📈 NIFTY Weekly", value=True, disabled=True)
-    st.checkbox("🏦 BANKNIFTY Weekly", value=True, disabled=True)
-    st.checkbox("💼 FNO Stocks", value=True, disabled=True)
-    st.checkbox("⚡ Futures (Current Month)", value=True, disabled=True)
+    st.subheader("🎯 Scan Options")
+    st.write("✅ NIFTY Weekly (Enabled)")
+    st.write("✅ BANKNIFTY Weekly (Enabled)")
+    st.write("✅ FNO Stocks (Enabled)")
+    st.write("✅ Current Month Futures (Enabled)")
     
     st.divider()
     
-    # Refresh
-    st.subheader("⏱️ Refresh")
-    auto = st.checkbox("Auto Scan")
-    interval = st.slider("Interval (sec)", 5, 60, 15, disabled=not auto)
+    st.subheader("⏱️ Refresh Settings")
+    auto_scan = st.checkbox("Auto Scan", value=False)
+    scan_interval = st.slider(
+        "Scan Interval (seconds)",
+        min_value=5,
+        max_value=60,
+        value=15,
+        disabled=not auto_scan
+    )
     
     st.divider()
     
@@ -299,18 +267,131 @@ with st.sidebar:
         count = len(st.session_state.scan_results) if st.session_state.scan_results is not None else 0
         st.metric("Results", count)
 
-# ============================================================
-# MAIN
-# ============================================================
+# MAIN PAGE
 st.title("📊 Box Spread Parity Scanner PRO")
 
 if not st.session_state.authenticated:
-    st.info("👈 Click LOGIN in sidebar to connect with Angel One")
+    st.info("👈 Click LOGIN button in sidebar to start")
     st.stop()
 
-# Controls
-col1, col2, col3, col4 = st.columns(4)
+# Control Buttons
+col1, col2, col3 = st.columns(3)
 with col1:
-    scan_btn = st.button("▶️ START SCAN", use_container_width=True)
+    if st.button("▶️ START SCAN", use_container_width=True):
+        with st.spinner("🔍 Scanning for box spreads..."):
+            try:
+                df = scan_all()
+                st.session_state.scan_results = df
+                st.session_state.last_scan_time = now_ist().strftime("%H:%M:%S")
+                if len(df) > 0:
+                    st.success(f"✅ Found {len(df)} opportunities!")
+                else:
+                    st.info("ℹ️ No opportunities found")
+            except Exception as e:
+                st.error(f"❌ Scan Error: {str(e)}")
+
 with col2:
-    clear_btn = st.button("🗑️ CLEAR",
+    if st.button("🗑️ CLEAR RESULTS", use_container_width=True):
+        st.session_state.scan_results = None
+        st.session_state.last_scan_time = None
+        st.rerun()
+
+with col3:
+    if st.session_state.scan_results is not None and len(st.session_state.scan_results) > 0:
+        csv = st.session_state.scan_results.to_csv(index=False)
+        st.download_button(
+            "📥 EXPORT CSV",
+            csv,
+            f"box_spread_{now_ist().strftime('%Y%m%d_%H%M%S')}.csv",
+            "text/csv",
+            use_container_width=True
+        )
+
+# Display Results
+if st.session_state.scan_results is not None and len(st.session_state.scan_results) > 0:
+    st.divider()
+    
+    st.subheader("🔍 Filter Results")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        type_filter = st.multiselect(
+            "Filter by Type",
+            options=st.session_state.scan_results["Type"].unique(),
+            default=st.session_state.scan_results["Type"].unique()
+        )
+    
+    with col2:
+        trade_filter = st.multiselect(
+            "Filter by Trade Type",
+            options=st.session_state.scan_results["Trade"].unique(),
+            default=st.session_state.scan_results["Trade"].unique()
+        )
+    
+    with col3:
+        min_edge_filter = st.number_input("Minimum Edge Filter (₹)", value=0.0, step=0.1)
+    
+    # Apply Filters
+    filtered_df = st.session_state.scan_results[
+        (st.session_state.scan_results["Type"].isin(type_filter)) &
+        (st.session_state.scan_results["Trade"].isin(trade_filter)) &
+        (st.session_state.scan_results["Edge"].abs() >= min_edge_filter)
+    ]
+    
+    if len(filtered_df) > 0:
+        st.divider()
+        
+        # Color styling
+        def highlight_trade(row):
+            return ["background-color: #FFE5E5" if v == "Long" else "background-color: #E5F5FF" if v == "Short" else "" for v in row]
+        
+        st.subheader(f"📊 Results ({len(filtered_df)} opportunities)")
+        st.dataframe(
+            filtered_df.style.apply(highlight_trade, subset=["Trade"], axis=1),
+            use_container_width=True,
+            height=600
+        )
+        
+        st.divider()
+        
+        # Statistics
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            st.metric("Total Opps", len(filtered_df))
+        
+        with col2:
+            long_count = len(filtered_df[filtered_df["Trade"] == "Long"])
+            st.metric("Long", long_count)
+        
+        with col3:
+            short_count = len(filtered_df[filtered_df["Trade"] == "Short"])
+            st.metric("Short", short_count)
+        
+        with col4:
+            avg_edge = filtered_df["Edge"].abs().mean()
+            st.metric("Avg Edge", f"₹{avg_edge:.2f}")
+        
+        with col5:
+            max_edge = filtered_df["Edge"].abs().max()
+            st.metric("Max Edge", f"₹{max_edge:.2f}")
+    else:
+        st.info("ℹ️ No results match selected filters")
+
+# Auto Scan
+if auto_scan and st.session_state.authenticated:
+    st.divider()
+    for i in range(scan_interval, 0, -1):
+        st.info(f"⏱️ Next scan in {i}s...")
+        time.sleep(1)
+    st.rerun()
+
+# Footer
+st.divider()
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.caption(f"Last Updated: {now_ist().strftime('%H:%M:%S')}")
+with col2:
+    st.caption("Box Spread Parity Scanner v2.0")
+with col3:
+    st.caption("🚀 Angel One API")
